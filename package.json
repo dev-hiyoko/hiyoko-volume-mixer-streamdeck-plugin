@@ -1,0 +1,23 @@
+{
+  "name": "streamdeck-audio-mixer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": ">=24.16.0"
+  },
+  "scripts": {
+    "build": "esbuild src/plugin.ts --bundle --platform=node --target=node24 --format=esm --outfile=fun.hiyoko.audiomixer.sdPlugin/bin/plugin.js",
+    "watch": "npm run build -- --watch",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@elgato/streamdeck": "^2.0.0",
+    "@elgato/utils": "^0.4.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,18 @@
+[tools]
+node = "24.16.0"
+
+[tasks.install]
+description = "Install npm dependencies"
+run = "npm install"
+
+[tasks.check]
+description = "Run TypeScript type checking"
+run = "npm run check"
+
+[tasks.build]
+description = "Bundle the Stream Deck plugin"
+run = "npm run build"
+
+[tasks.verify]
+description = "Run all local verification checks"
+depends = ["check", "build"]

@@ -1,0 +1,14 @@
+node_modules/
+
+# Build outputs
+fun.hiyoko.audiomixer.sdPlugin/bin/
+
+# Local logs and package-manager noise
+*.log
+npm-debug.log*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>JSON-RPC Command</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: system-ui, sans-serif;
+      }
+
+      body {
+        margin: 16px;
+        color: #f2f2f2;
+        background: #1f1f1f;
+      }
+
+      label {
+        display: block;
+        margin: 0 0 12px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      input,
+      textarea {
+        box-sizing: border-box;
+        width: 100%;
+        margin-top: 6px;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 8px;
+        color: #fff;
+        background: #2c2c2c;
+        font: inherit;
+      }
+
+      textarea {
+        min-height: 130px;
+        resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+
+      button {
+        width: 100%;
+        border: 0;
+        border-radius: 4px;
+        padding: 9px 10px;
+        color: #fff;
+        background: #0f7bca;
+        font-weight: 700;
+      }
+
+      .hint {
+        margin-top: 12px;
+        color: #b9b9b9;
+        font-size: 11px;
+        line-height: 1.45;
+      }
+    </style>
+  </head>
+  <body>
+    <label>
+      Method
+      <input id="method" placeholder="exampleMethodName" />
+    </label>
+
+    <label>
+      Params JSON
+      <textarea id="params" spellcheck="false">{}</textarea>
+    </label>
+
+    <button id="save">Save</button>
+    <p class="hint">
+      The Zenn scrap documents incoming events. Use this action to test request method names and params as they are discovered.
+    </p>
+
+    <script>
+      let websocket;
+      let actionContext;
+      const methodInput = document.getElementById("method");
+      const paramsInput = document.getElementById("params");
+      const saveButton = document.getElementById("save");
+
+      window.connectElgatoStreamDeckSocket = (port, uuid, registerEvent, info, actionInfo) => {
+        actionContext = JSON.parse(actionInfo).context;
+        websocket = new WebSocket(`ws://127.0.0.1:${port}`);
+        websocket.addEventListener("open", () => {
+          websocket.send(JSON.stringify({ event: registerEvent, uuid }));
+          const settings = JSON.parse(actionInfo).payload.settings || {};
+          methodInput.value = settings.method || "";
+          paramsInput.value = JSON.stringify(settings.params || {}, null, 2);
+        });
+      };
+
+      saveButton.addEventListener("click", () => {
+        let params;
+        try {
+          params = JSON.parse(paramsInput.value || "{}");
+        } catch {
+          paramsInput.focus();
+          return;
+        }
+
+        websocket.send(
+          JSON.stringify({
+            event: "setSettings",
+            context: actionContext,
+            payload: {
+              method: methodInput.value.trim(),
+              params,
+            },
+          }),
+        );
+      });
+    </script>
+  </body>
+</html>
