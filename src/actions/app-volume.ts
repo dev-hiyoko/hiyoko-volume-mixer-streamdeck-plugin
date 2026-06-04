@@ -44,7 +44,6 @@ function normalizeRole(role: string | undefined): MixerRole {
 @action({ UUID: "fun.hiyoko.volumemixer.app-volume" })
 export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   private titleTimer?: NodeJS.Timeout;
-  private lastActiveSignature = "";
 
   constructor() {
     super();
@@ -101,19 +100,15 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
     }
 
     try {
-      // Force a fresh read so detection isn't masked by the cache.
-      const instances = await audioControlClient.getApplicationInstances(0);
-      const signature = instances
-        .filter((instance) => instance.processID > 0 && instance.activity <= 3)
-        .map((instance) => instance.processID)
-        .sort((a, b) => a - b)
-        .join(",");
-      if (signature !== this.lastActiveSignature) {
-        // The active app set changed — re-sync saved per-device state (spec:
-        // detection also syncs saved volume/mute).
-        this.lastActiveSignature = signature;
-        scheduleAutoAppSync();
-      }
+      // Force a fresh read so detection / drift-correction isn't masked by the cache.
+      await audioControlClient.getApplicationInstances(0);
+      // Re-apply saved per-device volume/mute every cycle, not just when the app
+      // set changes. Some apps reset their own session to 100% shortly after
+      // launch (notably right after a PC restart), and a one-shot restore on
+      // appearance loses that race — the PID set never changes again, so the app
+      // stays at 100%. The sync only sends a change when the live value actually
+      // deviates from the saved value, so an unchanged set is near free.
+      scheduleAutoAppSync();
     } catch {
       // Ignore — server may be offline; titles will show that.
     }
@@ -167,6 +162,10 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         if (role === "mute-toggle") {
           await audioControlClient.setSystemDefaultDeviceMute(!device.mute);
         } else {
+          // Changing the volume implies the user wants to hear it: lift mute.
+          if (device.mute) {
+            await audioControlClient.setSystemDefaultDeviceMute(false);
+          }
           await audioControlClient.setSystemDefaultDeviceVolume(
             device.volume + (role === "volume-down" ? -global.step : global.step),
           );
@@ -201,10 +200,18 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         await updateSavedAutoAppState(primaryKey, { mute: nextMute });
       } else {
         const nextVolume = representative.volume + (role === "volume-down" ? -global.step : global.step);
+        // Changing the volume implies the user wants to hear it: lift mute.
+        const wasMuted = representative.mute;
         await Promise.all(
           instances.map((instance) => audioControlClient.setApplicationInstanceVolume(instance.processID, nextVolume)),
         );
-        await updateSavedAutoAppState(primaryKey, { volume: nextVolume });
+        if (wasMuted) {
+          await Promise.all(
+            instances.map((instance) => audioControlClient.setApplicationInstanceMute(instance.processID, false)),
+          );
+        }
+        // Persist mute:false too, or the per-poll sync would re-apply the old mute.
+        await updateSavedAutoAppState(primaryKey, wasMuted ? { volume: nextVolume, mute: false } : { volume: nextVolume });
       }
 
       await mirrorSavedAutoAppState(primaryKey, secondaryKey);

@@ -176,8 +176,14 @@ export async function getSavedAutoAppState(label: string): Promise<SavedAppState
   return state.devices?.[deviceKey]?.apps?.[label];
 }
 
-export async function syncAutoAppGroup(group: AutoAppGroup): Promise<void> {
-  const saved = await getSavedAutoAppState(group.label);
+/**
+ * Pulls every instance in the group back to its saved volume/mute. Only sends a
+ * change when the live value actually deviates (>0.5% volume, or a mute
+ * mismatch), so this is safe to run on every poll cycle as drift correction —
+ * some apps reset their own session to 100% shortly after launch, and a
+ * one-shot restore on appearance loses that race.
+ */
+async function applySavedStateToGroup(group: AutoAppGroup, saved: SavedAppState | undefined): Promise<void> {
   if (!saved) {
     return;
   }
@@ -198,9 +204,22 @@ export async function syncAutoAppGroup(group: AutoAppGroup): Promise<void> {
   );
 }
 
+export async function syncAutoAppGroup(group: AutoAppGroup): Promise<void> {
+  await applySavedStateToGroup(group, await getSavedAutoAppState(group.label));
+}
+
 export async function syncAllAutoAppGroups(): Promise<void> {
   const groups = await getAutoApplicationGroups();
-  await Promise.all(groups.map((group) => syncAutoAppGroup(group)));
+  if (groups.length === 0) {
+    return;
+  }
+
+  // Resolve the device key and saved map once instead of per group, so the
+  // per-poll drift-correction sweep doesn't fan out to N device round-trips.
+  const deviceKey = await getAutoDeviceKey();
+  const state = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
+  const savedApps = state.devices?.[deviceKey]?.apps ?? {};
+  await Promise.all(groups.map((group) => applySavedStateToGroup(group, savedApps[group.label])));
 }
 
 export function scheduleAutoAppSync(): void {
