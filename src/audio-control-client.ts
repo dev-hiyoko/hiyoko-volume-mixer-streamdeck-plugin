@@ -328,5 +328,14 @@ export function clampVolume(volume: number): number {
 }
 
 export function getApplicationLabel(application: ApplicationInstance): string {
-  return application.displayName ?? application.name ?? application.executableFile ?? `PID ${application.processID}`;
+  // Use `||` (not `??`) so an empty/whitespace displayName falls through to a
+  // stable identifier. The executable path is the same across restarts, whereas
+  // the PID fallback changes every launch — keying saved per-app volume on a
+  // PID-based label is why some apps were forgotten after a reboot.
+  return (
+    application.displayName?.trim() ||
+    application.name?.trim() ||
+    application.executableFile?.trim() ||
+    `PID ${application.processID}`
+  );
 }
