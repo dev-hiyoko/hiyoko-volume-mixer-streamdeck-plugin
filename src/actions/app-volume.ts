@@ -47,7 +47,11 @@ function normalizeRole(role: string | undefined): MixerRole {
 // while held. REPEAT_DELAY keeps a quick tap from repeating.
 const REPEAT_DELAY_MS = 350;
 const REPEAT_INTERVAL_MS = 130;
-const MAX_REPEATS = 150; // safety: stop a runaway hold if a key-up is ever missed
+// Safety stops for a hold that never sees its key-up (a missed/dropped key-up
+// would otherwise repeat forever — the "volume keeps dropping" bug). The volume
+// hitting 0 or 100% also stops it (see startHold), so these are just backstops.
+const MAX_REPEATS = 80;
+const MAX_HOLD_MS = 8000;
 
 @action({ UUID: "fun.hiyoko.volumemixer.app-volume" })
 export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
@@ -205,16 +209,27 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   private startHold(view: KeyView & { id: string }, settings: AppMixerSettings): void {
     const id = view.id;
     this.stopHold(id);
+    const startedAt = Date.now();
     let repeats = 0;
     const tick = async (): Promise<void> => {
+      let result: number | undefined;
       try {
-        await this.applyStep(view, settings);
+        result = await this.applyStep(view, settings);
       } catch {
         this.stopHold(id);
         return;
       }
-      // Released (or disappeared) while the step was in flight — stop here.
-      if (!this.holdTimers.has(id) || (repeats += 1) >= MAX_REPEATS) {
+      repeats += 1;
+      // Stop the repeat when the volume can't move any further (hit 0 or 100%).
+      // This is the real guard against "the volume keeps dropping": even if the
+      // key-up is never delivered, a held volume-down settles at 0 and stops.
+      const atLimit = result !== undefined && (result <= 0.0001 || result >= 0.9999);
+      const hitCap = repeats >= MAX_REPEATS || Date.now() - startedAt >= MAX_HOLD_MS;
+      // Released/disappeared (holdTimers cleared), hit a limit, or hit a backstop.
+      if (!this.holdTimers.has(id) || atLimit || hitCap) {
+        if (hitCap) {
+          streamDeck.logger.warn("Volume hold hit its safety cap — a key-up was likely missed.");
+        }
         this.stopHold(id);
         return;
       }
@@ -236,7 +251,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
    * computed value (no settle-delay or read-back), so auto-repeat stays snappy
    * and light on the audio server.
    */
-  private async applyStep(view: KeyView, settings: AppMixerSettings): Promise<void> {
+  private async applyStep(view: KeyView, settings: AppMixerSettings): Promise<number | undefined> {
     const role = normalizeRole(settings.role);
     const global = await getGlobalMixerSettings();
 
@@ -246,7 +261,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         const muted = !device.mute;
         await audioControlClient.setSystemDefaultDeviceMute(muted);
         await this.showImage(view, renderKeyImage({ kind: "mute", name: "マスター", muted }));
-        return;
+        return undefined;
       }
       // Changing the volume implies the user wants to hear it: lift mute.
       if (device.mute) {
@@ -258,7 +273,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         view,
         renderKeyImage({ kind: "volume", direction: role === "volume-down" ? "down" : "up", name: "マスター", percent: nextVolume * 100 }),
       );
-      return;
+      return nextVolume;
     }
 
     const target = await resolveApplicationTargetGroup({
@@ -271,7 +286,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       // Empty slot: nothing to control yet, but the key stays placed and will
       // pick up an app as soon as one occupies this slot.
       await this.renderKey(view, settings);
-      return;
+      return undefined;
     }
 
     const { representative, instances } = target;
@@ -281,6 +296,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
     const primaryKey = getAutoAppStateKey(representative, global.groupDuplicates);
     const secondaryKey = getAutoAppStateKey(representative, !global.groupDuplicates);
 
+    let result: number | undefined;
     if (role === "mute-toggle") {
       const nextMute = !representative.mute;
       await Promise.all(
@@ -306,9 +322,11 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         view,
         renderKeyImage({ kind: "volume", direction: role === "volume-down" ? "down" : "up", name, percent: nextVolume * 100, count }),
       );
+      result = nextVolume;
     }
 
     await mirrorSavedAutoAppState(primaryKey, secondaryKey);
+    return result;
   }
 
   /** Draws the key as a glyph image (speaker / mute slash / volume ±). */
