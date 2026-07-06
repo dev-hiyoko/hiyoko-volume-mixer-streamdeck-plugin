@@ -1,5 +1,6 @@
 [tools]
 node = "24.16.0"
+rust = "stable"
 
 [tasks.install]
 description = "Install npm dependencies"
@@ -9,10 +10,14 @@ run = "npm install"
 description = "Run TypeScript type checking"
 run = "npm run check"
 
+[tasks.build-server]
+description = "Build the Rust WASAPI audio server and bundle it into the plugin"
+run = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-server.ps1"
+
 [tasks.build]
 description = "Bundle the Stream Deck plugin"
 run = "npm run build"
 
 [tasks.verify]
 description = "Run all local verification checks"
-depends = ["check", "build"]
+depends = ["check", "build-server", "build"]

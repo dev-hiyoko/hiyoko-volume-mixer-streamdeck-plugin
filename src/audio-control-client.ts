@@ -1,8 +1,23 @@
 import streamDeck from "@elgato/streamdeck";
 import WebSocket, { type RawData } from "ws";
 
-const AUDIO_CONTROL_URL = "ws://127.0.0.1:1844";
+// Our bundled WASAPI server (see audio-server-process.ts), not the Elgato
+// server's 1844.
+const AUDIO_CONTROL_URL = "ws://127.0.0.1:1845";
 const REQUEST_TIMEOUT_MS = 3000;
+
+// Reconnect backoff. The audio server may be briefly unavailable — during the
+// plugin's own startup before it has finished spawning, or across a manual
+// restart — so the ~1.5s poll loop must not hammer a fresh socket at it every
+// cycle. After repeated failures we stop attempting until an exponentially
+// growing window elapses, then let exactly one retry through (half-open); a
+// real response resets it, another failure widens it (capped).
+const CONNECT_BACKOFF_BASE_MS = 1000;
+const CONNECT_BACKOFF_MAX_MS = 30000;
+// Consecutive request timeouts that mean the socket is open but the server has
+// stopped answering (that state emits no close event, so connect-failure
+// backoff alone never engages). At this many, tear the socket down and back off.
+const REQUEST_TIMEOUT_TRIP = 3;
 
 export type AudioControlActivity = 2 | 3 | 4 | number;
 
@@ -57,8 +72,20 @@ export class AudioControlClient {
   private messageListeners = new Set<(event: any) => void>();
   private instancesCache?: { at: number; value: ApplicationInstance[] };
   private instancesInFlight?: Promise<ApplicationInstance[]>;
+  // Circuit-breaker state (see CONNECT_BACKOFF_* and ensureConnected).
+  // `connectBlockedUntil` is a timestamp before which lazy reconnects fast-fail;
+  // `connectFailures` sizes the backoff; `requestTimeouts` counts consecutive
+  // unanswered requests so a hung-but-open server also trips it.
+  private connectFailures = 0;
+  private connectBlockedUntil = 0;
+  private requestTimeouts = 0;
 
   async connect(): Promise<void> {
+    // A deliberate connect (plugin startup, or the restart-server recovery
+    // probe) must try now, not sit behind the lazy-reconnect backoff window — a
+    // bare connect doesn't enumerate sessions, so it can't re-trip the crash.
+    this.connectFailures = 0;
+    this.connectBlockedUntil = 0;
     await this.ensureConnected();
   }
 
@@ -72,6 +99,11 @@ export class AudioControlClient {
     const socket = this.socket;
     this.socket = undefined;
     this.connectPromise = undefined;
+    // A forced disconnect is a deliberate reset point (the restart-server key
+    // calls it before re-probing), so clear the breaker too.
+    this.connectFailures = 0;
+    this.connectBlockedUntil = 0;
+    this.requestTimeouts = 0;
     if (socket) {
       try {
         socket.terminate();
@@ -135,13 +167,10 @@ export class AudioControlClient {
     this.instancesInFlight = (async () => {
       try {
         const count = await this.getApplicationInstanceCount();
-        // Read every index concurrently rather than sequentially. The audio
-        // server aborts (ucrtbase, 0xc0000409) when an index goes out of range
-        // because a session ended between reading the count and reading that
-        // index — and a sequential loop holds that window open for `count`
-        // round-trips, the worst possible exposure. Firing all reads at once
-        // collapses the window to a single round-trip, so a session that
-        // disappears mid-enumeration is far less likely to be indexed.
+        // Read every index concurrently rather than sequentially: the count call
+        // snapshots the session list server-side and each index reads from that
+        // snapshot, so the whole enumeration is consistent and collapses to a
+        // single round-trip instead of `count` sequential ones.
         const results = await Promise.allSettled(
           Array.from({ length: count }, (_, index) => this.getApplicationInstanceAtIndex(index)),
         );
@@ -208,6 +237,7 @@ export class AudioControlClient {
     const response = new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
+        this.noteRequestTimeout();
         reject(new Error(`Audio Control request timed out: ${method}`));
       }, REQUEST_TIMEOUT_MS);
 
@@ -225,6 +255,13 @@ export class AudioControlClient {
 
     if (this.connectPromise) {
       return this.connectPromise;
+    }
+
+    // Half-open the breaker: inside the backoff window, fail fast without
+    // opening a socket. The poll loop keeps calling this, so the first call
+    // after the window elapses is the single retry that probes the server.
+    if (Date.now() < this.connectBlockedUntil) {
+      throw new Error("Audio Control connection is backing off after repeated failures.");
     }
 
     this.connectPromise = new Promise<void>((resolve, reject) => {
@@ -252,6 +289,7 @@ export class AudioControlClient {
         cleanupStartupListeners();
         this.connectPromise = undefined;
         this.socket = undefined;
+        this.noteConnectFailure();
         reject(error);
       };
 
@@ -259,6 +297,7 @@ export class AudioControlClient {
         cleanupStartupListeners();
         this.connectPromise = undefined;
         this.socket = undefined;
+        this.noteConnectFailure();
         reject(new Error("Audio Control WebSocket closed before connection completed."));
       };
 
@@ -271,6 +310,11 @@ export class AudioControlClient {
   }
 
   private handleMessage(data: RawData): void {
+    // Any inbound byte proves the server is alive and answering, so reset the
+    // breaker here rather than on a bare socket open (which a hung server also
+    // grants before it stops responding).
+    this.noteHealthy();
+
     let message: JsonRpcSuccess<unknown> | JsonRpcError;
 
     try {
@@ -318,6 +362,49 @@ export class AudioControlClient {
       pending.reject(new Error(`Audio Control WebSocket closed during request: ${pending.method}`));
       this.pending.delete(id);
     }
+  }
+
+  /** Server answered: clear the breaker so the next request goes through clean. */
+  private noteHealthy(): void {
+    this.connectFailures = 0;
+    this.connectBlockedUntil = 0;
+    this.requestTimeouts = 0;
+  }
+
+  /** A connect attempt failed: grow the backoff window (capped). */
+  private noteConnectFailure(): void {
+    this.connectFailures += 1;
+    const backoff = Math.min(
+      CONNECT_BACKOFF_MAX_MS,
+      CONNECT_BACKOFF_BASE_MS * 2 ** (this.connectFailures - 1),
+    );
+    this.connectBlockedUntil = Date.now() + backoff;
+  }
+
+  /**
+   * A request timed out. Enough consecutive timeouts means the socket is open
+   * but the server has stopped answering (a hang, which fires no close event),
+   * so tear the socket down and back off as if the connect had failed. Guarded
+   * on a live socket so a whole batch of simultaneous timeouts trips only once.
+   */
+  private noteRequestTimeout(): void {
+    if (!this.socket) {
+      return;
+    }
+    this.requestTimeouts += 1;
+    if (this.requestTimeouts < REQUEST_TIMEOUT_TRIP) {
+      return;
+    }
+    this.requestTimeouts = 0;
+    const socket = this.socket;
+    this.socket = undefined;
+    this.connectPromise = undefined;
+    try {
+      socket.terminate();
+    } catch {
+      // Already gone — nothing to do.
+    }
+    this.noteConnectFailure();
   }
 }
 

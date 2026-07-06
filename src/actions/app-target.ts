@@ -11,11 +11,15 @@ export type AppTargetSettings = {
   groupDuplicates?: boolean;
   /** App-name keys in priority order (global). */
   order?: string[];
+  /** Detected-name -> custom label; same label groups sessions together. */
+  aliases?: Record<string, string>;
 };
 
 export type ResolvedTargetGroup = {
   representative: ApplicationInstance;
   instances: ApplicationInstance[];
+  /** The group's key (alias or detected name) — also the saved-state key. */
+  label: string;
 };
 
 /**
@@ -32,9 +36,10 @@ export async function resolveApplicationTargetGroup(
     showApps: settings.showApps ?? "active",
     groupDuplicates: settings.groupDuplicates ?? true,
     order: settings.order ?? [],
+    aliases: settings.aliases ?? {},
   });
   const group = groups[slot];
-  return group ? { representative: group.representative, instances: group.instances } : undefined;
+  return group ? { representative: group.representative, instances: group.instances, label: group.label } : undefined;
 }
 
 /** Ordered slot → app-name-key list for the Property Inspector preview. */
@@ -42,11 +47,13 @@ export async function listDetectedAppNames(
   showApps: "all" | "active",
   groupDuplicates: boolean,
   order: string[] = [],
+  aliases: Record<string, string> = {},
 ): Promise<string[]> {
   const groups = getAutoAppGroups(await audioControlClient.getApplicationInstances(), {
     showApps,
     groupDuplicates,
     order,
+    aliases,
   });
   return groups.map((group) => appNameKey(group.representative));
 }

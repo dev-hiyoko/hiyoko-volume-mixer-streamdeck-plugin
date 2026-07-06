@@ -34,6 +34,8 @@ export type AutoAppOptions = {
   groupDuplicates?: boolean;
   /** App-name keys in priority order; listed apps sort to the front. */
   order?: string[];
+  /** Detected-name -> custom label. Sessions given the same custom label group together. */
+  aliases?: Record<string, string>;
 };
 
 /**
@@ -56,6 +58,7 @@ export function getAutoAppGroups(instances: ApplicationInstance[], options: Auto
   const showApps = options.showApps ?? "active";
   const groupDuplicates = options.groupDuplicates ?? true;
   const order = options.order ?? [];
+  const aliases = options.aliases ?? {};
   const orderIndex = (instance: ApplicationInstance): number => {
     const i = order.indexOf(appNameKey(instance));
     return i === -1 ? Number.MAX_SAFE_INTEGER : i;
@@ -68,7 +71,7 @@ export function getAutoAppGroups(instances: ApplicationInstance[], options: Auto
     .filter((item) => showApps === "all" || item.activity <= 3);
 
   for (const instance of candidates) {
-    const key = getAutoAppLabel(instance, groupDuplicates);
+    const key = getAutoAppLabel(instance, groupDuplicates, aliases);
     const existing = groups.get(key) ?? [];
     existing.push(instance);
     groups.set(key, existing);
@@ -106,13 +109,30 @@ export function getAutoAppGroups(instances: ApplicationInstance[], options: Auto
     });
 }
 
-export function getAutoAppLabel(instance: ApplicationInstance, groupDuplicates = true): string {
-  const baseLabel = getApplicationLabel(instance).trim() || `PID ${instance.processID}`;
-  return groupDuplicates ? baseLabel : `${baseLabel}#${instance.processID}`;
+/**
+ * The grouping / saved-state key for a session. Sessions collapse into one group
+ * when this key matches, so it keys on the user's custom label (alias) when set,
+ * falling back to the detected name — assigning two sessions the same label
+ * groups them. With groupDuplicates off, the pid suffix keeps every session its
+ * own group.
+ */
+export function getAutoAppLabel(
+  instance: ApplicationInstance,
+  groupDuplicates = true,
+  aliases: Record<string, string> = {},
+): string {
+  const base = getApplicationLabel(instance).trim() || `PID ${instance.processID}`;
+  const alias = aliases[appNameKey(instance)]?.trim();
+  const named = alias || base;
+  return groupDuplicates ? named : `${named}#${instance.processID}`;
 }
 
-export function getAutoAppStateKey(instance: ApplicationInstance, groupDuplicates = true): string {
-  return getAutoAppLabel(instance, groupDuplicates);
+export function getAutoAppStateKey(
+  instance: ApplicationInstance,
+  groupDuplicates = true,
+  aliases: Record<string, string> = {},
+): string {
+  return getAutoAppLabel(instance, groupDuplicates, aliases);
 }
 
 export async function getAutoApplicationGroups(): Promise<AutoAppGroup[]> {
@@ -124,6 +144,7 @@ export async function getAutoApplicationGroups(): Promise<AutoAppGroup[]> {
     showApps: global.showApps,
     groupDuplicates: global.groupDuplicates,
     order: global.order,
+    aliases: global.aliases,
   });
 }
 
@@ -183,7 +204,11 @@ export async function getSavedAutoAppState(label: string): Promise<SavedAppState
  * some apps reset their own session to 100% shortly after launch, and a
  * one-shot restore on appearance loses that race.
  */
-async function applySavedStateToGroup(group: AutoAppGroup, saved: SavedAppState | undefined): Promise<void> {
+async function applySavedStateToGroup(
+  group: AutoAppGroup,
+  saved: SavedAppState | undefined,
+  enforceMute: boolean,
+): Promise<void> {
   if (!saved) {
     return;
   }
@@ -201,7 +226,11 @@ async function applySavedStateToGroup(group: AutoAppGroup, saved: SavedAppState 
           }
         }
 
-        if (typeof saved.mute === "boolean" && instance.mute !== saved.mute) {
+        // Only restore mute when the app just appeared (relaunch), never on the
+        // steady-state drift sweep — otherwise unmuting from the Windows mixer
+        // (or anywhere outside the plugin) is instantly reverted, so the user
+        // can never turn a saved mute back off.
+        if (enforceMute && typeof saved.mute === "boolean" && instance.mute !== saved.mute) {
           await audioControlClient.setApplicationInstanceMute(instance.processID, saved.mute);
         }
       } catch (error) {
@@ -211,13 +240,18 @@ async function applySavedStateToGroup(group: AutoAppGroup, saved: SavedAppState 
   );
 }
 
+// Labels present on the previous sync sweep. A label absent here but present now
+// means the app just (re)appeared, which is the only time we restore saved mute.
+let knownGroupLabels = new Set<string>();
+
 export async function syncAutoAppGroup(group: AutoAppGroup): Promise<void> {
-  await applySavedStateToGroup(group, await getSavedAutoAppState(group.label));
+  await applySavedStateToGroup(group, await getSavedAutoAppState(group.label), true);
 }
 
 export async function syncAllAutoAppGroups(): Promise<void> {
   const groups = await getAutoApplicationGroups();
   if (groups.length === 0) {
+    knownGroupLabels = new Set();
     return;
   }
 
@@ -226,7 +260,17 @@ export async function syncAllAutoAppGroups(): Promise<void> {
   const deviceKey = await getAutoDeviceKey();
   const state = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
   const savedApps = state.devices?.[deviceKey]?.apps ?? {};
-  await Promise.all(groups.map((group) => applySavedStateToGroup(group, savedApps[group.label])));
+  const seen = new Set<string>();
+  await Promise.all(
+    groups.map((group) => {
+      seen.add(group.label);
+      // Restore mute only for groups that weren't present last sweep (a fresh
+      // launch); steady-state sweeps correct volume drift but leave mute alone.
+      const justAppeared = !knownGroupLabels.has(group.label);
+      return applySavedStateToGroup(group, savedApps[group.label], justAppeared);
+    }),
+  );
+  knownGroupLabels = seen;
 }
 
 export function scheduleAutoAppSync(): void {

@@ -58,6 +58,11 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   private titleTimer?: NodeJS.Timeout;
   // Per-key auto-repeat timers, keyed by action instance id.
   private holdTimers = new Map<string, NodeJS.Timeout>();
+  // Action ids whose key is currently held down. onKeyDown awaits the first
+  // step (a server round-trip), during which a quick tap's onKeyUp can already
+  // arrive; we must not start auto-repeat if the key was released in that gap,
+  // or the repeat runs orphaned to 0/100% — the "tapping runs away" bug.
+  private pressed = new Set<string>();
 
   constructor() {
     super();
@@ -67,9 +72,10 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       this.scheduleTitleRefresh();
     });
 
-    // The audio server's change notifications are unreliable, so poll for newly
-    // started / stopped audio apps. The interval is a global setting (CPU cost),
-    // re-read each cycle so changes take effect without a restart.
+    // The server is polled for newly started / stopped audio apps (it doesn't
+    // push change notifications). The interval is a global setting (CPU cost),
+    // re-read each cycle so changes take effect without a restart. The onMessage
+    // handler below stays for forward-compatibility if push events are added.
     this.pollLoop().catch((error) => {
       streamDeck.logger.warn(`Poll loop error: ${String(error)}`);
     });
@@ -174,7 +180,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
     let apps: string[] = [];
     try {
       const global = await getGlobalMixerSettings();
-      apps = await listDetectedAppNames(global.showApps, global.groupDuplicates, global.order);
+      apps = await listDetectedAppNames(global.showApps, global.groupDuplicates, global.order, global.aliases);
     } catch {
       apps = [];
     }
@@ -183,6 +189,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
 
   override async onKeyDown(ev: KeyDownEvent<AppMixerSettings>): Promise<void> {
     const settings = ev.payload.settings;
+    this.pressed.add(ev.action.id);
     try {
       await this.applyStep(ev.action, settings);
     } catch {
@@ -190,18 +197,23 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       await this.showImage(ev.action, renderKeyImage({ kind: "offline" }));
       return;
     }
-    // Mute is a one-shot toggle; volume keys auto-repeat while held.
-    if (normalizeRole(settings.role) !== "mute-toggle") {
+    // Mute is a one-shot toggle; volume keys auto-repeat while held. Only begin
+    // the repeat if the key is still down — a quick tap's onKeyUp may have
+    // already fired during the awaited step above, and starting a hold then
+    // would leave it repeating with no key-up left to stop it.
+    if (normalizeRole(settings.role) !== "mute-toggle" && this.pressed.has(ev.action.id)) {
       this.startHold(ev.action, settings);
     }
   }
 
   override async onKeyUp(ev: KeyUpEvent<AppMixerSettings>): Promise<void> {
+    this.pressed.delete(ev.action.id);
     this.stopHold(ev.action.id);
   }
 
   override async onWillDisappear(ev: WillDisappearEvent<AppMixerSettings>): Promise<void> {
     // The key is gone (profile switch, removal) — don't keep repeating into it.
+    this.pressed.delete(ev.action.id);
     this.stopHold(ev.action.id);
   }
 
@@ -281,6 +293,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       showApps: global.showApps,
       groupDuplicates: global.groupDuplicates,
       order: global.order,
+      aliases: global.aliases,
     });
     if (!target) {
       // Empty slot: nothing to control yet, but the key stays placed and will
@@ -293,8 +306,8 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
     const nameKey = appNameKey(representative);
     const name = global.aliases[nameKey] || nameKey;
     const count = instances.length;
-    const primaryKey = getAutoAppStateKey(representative, global.groupDuplicates);
-    const secondaryKey = getAutoAppStateKey(representative, !global.groupDuplicates);
+    const primaryKey = getAutoAppStateKey(representative, global.groupDuplicates, global.aliases);
+    const secondaryKey = getAutoAppStateKey(representative, !global.groupDuplicates, global.aliases);
 
     let result: number | undefined;
     if (role === "mute-toggle") {
@@ -350,6 +363,7 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         showApps: global.showApps,
         groupDuplicates: global.groupDuplicates,
         order: global.order,
+        aliases: global.aliases,
       });
       if (!target) {
         const slot = Math.max(0, Number(settings.slot ?? 0));

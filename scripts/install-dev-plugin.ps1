@@ -6,6 +6,7 @@ $destination = Join-Path $env:APPDATA "Elgato\StreamDeck\Plugins\fun.hiyoko.volu
 
 Push-Location $root
 try {
+  & (Join-Path $PSScriptRoot "build-server.ps1")
   npm run build
 
   if (Test-Path -LiteralPath $destination) {

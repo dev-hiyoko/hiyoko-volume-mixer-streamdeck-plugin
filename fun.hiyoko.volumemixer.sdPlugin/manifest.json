@@ -6,7 +6,7 @@
   "Category": "Hiyoko Volume Mixer",
   "CategoryIcon": "imgs/category-icon",
   "Description": "アプリの音量・ミュートを自動検出して操作する音量ミキサーです。",
-  "Version": "0.2.0.0",
+  "Version": "1.0.0.0",
   "UUID": "fun.hiyoko.volumemixer",
   "Icon": "imgs/plugin-icon",
   "DisableCaching": true,
@@ -41,7 +41,7 @@
     {
       "UUID": "fun.hiyoko.volumemixer.restart-server",
       "Name": "音声サーバー再起動",
-      "Tooltip": "ElgatoAudioControlServer を再起動して、ハング/オフラインから復旧します。",
+      "Tooltip": "内蔵の音声サーバーを再起動して、オフラインから復旧します。",
       "Icon": "imgs/action-icon",
       "Controllers": ["Keypad"],
       "States": [
