@@ -24,6 +24,7 @@ import { appNameKey, listDetectedAppNames, resolveApplicationTargetGroup } from 
 type MixerRole = "volume-up" | "volume-down" | "mute-toggle";
 
 type KeyView = {
+  id: string;
   setTitle(title: string): Promise<void>;
   setImage(image: string): Promise<void>;
 };
@@ -63,14 +64,29 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   // arrive; we must not start auto-repeat if the key was released in that gap,
   // or the repeat runs orphaned to 0/100% — the "tapping runs away" bug.
   private pressed = new Set<string>();
+  // Last image pushed per key (by action id). The poll loop re-renders every key
+  // every ~1.5s, but the image only changes when the volume/mute/app actually
+  // changes — so we skip setImage when it would push a byte-identical image. The
+  // Stream Deck host appears to retain memory per setImage call, so an
+  // unconditional re-push every 1.5s is what grew the host to multiple GB over a
+  // day; deduping here keeps steady-state pushes at zero.
+  private lastImage = new Map<string, string>();
+  // Per-key settings cache (by action id). updateVisibleTitles runs on every
+  // title refresh (many times a second when audio is active); calling
+  // action.getSettings() there is a Stream Deck host round-trip per key, part of
+  // the IPC flood that leaked the host by ~500MB/h (measured 2026-07-19). Key
+  // settings only change on appear / reconfigure, so serve them from this cache
+  // and never round-trip on the hot path.
+  private settingsCache = new Map<string, AppMixerSettings>();
 
   constructor() {
     super();
 
-    // Global (shared) settings changed — slot ordering / step may differ now.
-    streamDeck.settings.onDidReceiveGlobalSettings(() => {
-      this.scheduleTitleRefresh();
-    });
+    // NOTE: we deliberately do NOT subscribe to onDidReceiveGlobalSettings to
+    // refresh/invalidate here. getGlobalSettings() makes the host emit that very
+    // event, so reacting to it created a self-sustaining round-trip storm
+    // (~1600/min) that leaked the host (measured 2026-07-19). The 1.5s poll picks
+    // up any user setting change within the settings cache's short TTL.
 
     // The server is polled for newly started / stopped audio apps (it doesn't
     // push change notifications). The interval is a global setting (CPU cost),
@@ -89,10 +105,18 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         return;
       }
 
+      // NOTE: appInstanceActivityChanged is deliberately NOT handled here. It
+      // fires continuously while any app plays audio (the level meter moving),
+      // but the key only shows volume/mute/name/app-set — none of which its
+      // payload changes, so reacting to it just burned CPU on thousands of
+      // no-op re-renders a minute. Changes to the *active app set* (an app
+      // starting/stopping sound) are picked up by the 1.5s poll instead, so the
+      // only cost is up to ~1.5s of latency on an app entering/leaving the list.
+      // (This is a CPU/efficiency cleanup — the host memory leak itself was the
+      // settings round-trip storm, fixed by caching in global-settings.ts.)
       if (
         event.method === "preferredSessionInstanceVolumeChanged" ||
         event.method === "preferredSessionInstanceMuteChanged" ||
-        event.method === "appInstanceActivityChanged" ||
         event.method === "appInstanceAddRemove"
       ) {
         // Detection doubles as a sync point: re-apply saved per-device state.
@@ -164,10 +188,12 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   }
 
   override async onWillAppear(ev: WillAppearEvent<AppMixerSettings>): Promise<void> {
+    this.settingsCache.set(ev.action.id, ev.payload.settings);
     await this.renderKey(ev.action, ev.payload.settings);
   }
 
   override async onDidReceiveSettings(ev: DidReceiveSettingsEvent<AppMixerSettings>): Promise<void> {
+    this.settingsCache.set(ev.action.id, ev.payload.settings);
     await this.renderKey(ev.action, ev.payload.settings);
   }
 
@@ -215,6 +241,10 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
     // The key is gone (profile switch, removal) — don't keep repeating into it.
     this.pressed.delete(ev.action.id);
     this.stopHold(ev.action.id);
+    // Drop its cached entries so the maps can't grow unbounded across profile
+    // switches, and so the key re-renders fresh if it reappears.
+    this.lastImage.delete(ev.action.id);
+    this.settingsCache.delete(ev.action.id);
   }
 
   /** Begins auto-repeat for a held volume key; cleared by onKeyUp. */
@@ -386,6 +416,14 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   }
 
   private async showImage(view: KeyView, image: string): Promise<void> {
+    // Skip the push when the key already shows this exact image. renderKeyImage
+    // is deterministic, so an unchanged volume/mute/app yields a byte-identical
+    // string — re-sending it every poll only feeds the host's per-setImage
+    // memory growth without changing anything on screen.
+    if (this.lastImage.get(view.id) === image) {
+      return;
+    }
+    this.lastImage.set(view.id, image);
     // The image carries all text, so keep the Stream Deck title empty.
     await view.setImage(image);
     await view.setTitle("");
@@ -394,7 +432,14 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   private async updateVisibleTitles(): Promise<void> {
     await Promise.all(
       this.actions.map(async (actionInstance) => {
-        const settings = await actionInstance.getSettings<AppMixerSettings>();
+        // Serve settings from the cache to avoid a host round-trip per key on
+        // this hot path; fall back to a one-time fetch if a key somehow isn't
+        // cached yet (then cache it), so a fresh key still renders correctly.
+        let settings = this.settingsCache.get(actionInstance.id);
+        if (!settings) {
+          settings = await actionInstance.getSettings<AppMixerSettings>();
+          this.settingsCache.set(actionInstance.id, settings);
+        }
         await this.renderKey(actionInstance, settings);
       }),
     );

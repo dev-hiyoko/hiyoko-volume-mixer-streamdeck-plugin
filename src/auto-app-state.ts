@@ -20,6 +20,33 @@ const DEFAULT_GLOBAL_STATE: GlobalAutoState = {
   devices: {},
 };
 
+// Cached copy of the global auto-state (saved per-app volume/mute). The per-poll
+// drift-correction sweep (syncAllAutoAppGroups) reads this several times a
+// second; each read was an uncached Stream Deck host round-trip — the leak that
+// remained after the render path was cached (measured 2026-07-19). Saved state
+// only changes when we write it, so serve hot reads from cache (short TTL as a
+// self-healing backstop) and write through on save.
+let cachedState: GlobalAutoState | undefined;
+let cachedStateAt = 0;
+const STATE_TTL_MS = 3000;
+
+/** Hot-path read: cached copy of the global auto-state. */
+async function readGlobalAutoStateCached(): Promise<GlobalAutoState> {
+  const now = Date.now();
+  if (cachedState && now - cachedStateAt < STATE_TTL_MS) {
+    return cachedState;
+  }
+  cachedState = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
+  cachedStateAt = now;
+  return cachedState;
+}
+
+/** Record a freshly written state so hot reads see it without a round-trip. */
+function rememberWrittenState(state: GlobalAutoState): void {
+  cachedState = state;
+  cachedStateAt = Date.now();
+}
+
 let syncTimer: NodeJS.Timeout | undefined;
 
 export type AutoAppGroup = {
@@ -163,11 +190,13 @@ export async function updateSavedAutoAppState(label: string, nextState: SavedApp
 
   currentDeviceState.apps = apps;
   devices[deviceKey] = currentDeviceState;
-  await streamDeck.settings.setGlobalSettings({
+  const written: GlobalAutoState = {
     ...DEFAULT_GLOBAL_STATE,
     ...state,
     devices,
-  });
+  };
+  await streamDeck.settings.setGlobalSettings(written);
+  rememberWrittenState(written);
 }
 
 export async function mirrorSavedAutoAppState(sourceLabel: string, mirrorLabel: string): Promise<void> {
@@ -184,16 +213,18 @@ export async function mirrorSavedAutoAppState(sourceLabel: string, mirrorLabel: 
   apps[mirrorLabel] = { ...saved };
   currentDeviceState.apps = apps;
   devices[deviceKey] = currentDeviceState;
-  await streamDeck.settings.setGlobalSettings({
+  const written: GlobalAutoState = {
     ...DEFAULT_GLOBAL_STATE,
     ...state,
     devices,
-  });
+  };
+  await streamDeck.settings.setGlobalSettings(written);
+  rememberWrittenState(written);
 }
 
 export async function getSavedAutoAppState(label: string): Promise<SavedAppState | undefined> {
   const deviceKey = await getAutoDeviceKey();
-  const state = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
+  const state = await readGlobalAutoStateCached();
   return state.devices?.[deviceKey]?.apps?.[label];
 }
 
@@ -258,7 +289,7 @@ export async function syncAllAutoAppGroups(): Promise<void> {
   // Resolve the device key and saved map once instead of per group, so the
   // per-poll drift-correction sweep doesn't fan out to N device round-trips.
   const deviceKey = await getAutoDeviceKey();
-  const state = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
+  const state = await readGlobalAutoStateCached();
   const savedApps = state.devices?.[deviceKey]?.apps ?? {};
   const seen = new Set<string>();
   await Promise.all(

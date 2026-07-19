@@ -56,11 +56,33 @@ function normalizeAliases(aliases: Record<string, string> | undefined): Record<s
   return out;
 }
 
-export async function getGlobalMixerSettings(): Promise<GlobalMixerSettings> {
+// Cached parse of the global settings. getGlobalSettings() is a round-trip to
+// the Stream Deck host, and the poll/title-refresh path calls this once per key
+// render (thousands of times a minute when audio is active). Each host round-trip
+// grew StreamDeck.exe by ~500MB/h — measured 2026-07-19: with the plugin the host
+// leaked unbounded, without it the host stayed flat. Global settings change only
+// when the user edits them, so cache the parsed result with a short TTL; the poll
+// loop re-reads every ~1.5s, so a user edit is reflected within the TTL.
+//
+// Two hazards this guards against, both observed on 2026-07-19:
+//  1. Concurrent stampede — a title refresh renders all keys via Promise.all, so
+//     15 renders hit a cold cache at once and would fire 15 identical round-trips.
+//     A single in-flight promise coalesces them into one.
+//  2. Feedback loop — do NOT invalidate this cache from onDidReceiveGlobalSettings.
+//     getGlobalSettings() itself makes the host emit that event, so invalidating
+//     there means every read triggers an event that forces the next read to
+//     re-fetch: a self-sustaining ~1600 round-trips/min storm. TTL-only expiry
+//     avoids it entirely.
+let cached: GlobalMixerSettings | undefined;
+let cachedAt = 0;
+let inflight: Promise<GlobalMixerSettings> | undefined;
+const CACHE_TTL_MS = 3000;
+
+async function fetchGlobalMixerSettings(): Promise<GlobalMixerSettings> {
   const state = (await streamDeck.settings.getGlobalSettings<GlobalState>()) ?? {};
   const d = state.detection ?? {};
   const pollMs = Number(d.pollMs);
-  return {
+  cached = {
     showApps: d.showApps === "all" ? "all" : "active",
     groupDuplicates: d.groupDuplicates !== false,
     step: typeof d.step === "number" && d.step > 0 && d.step <= 1 ? d.step : DEFAULT_MIXER_SETTINGS.step,
@@ -69,4 +91,23 @@ export async function getGlobalMixerSettings(): Promise<GlobalMixerSettings> {
     icons: normalizeAliases(state.icons),
     order: Array.isArray(state.order) ? state.order.filter((k): k is string => typeof k === "string") : [],
   };
+  cachedAt = Date.now();
+  return cached;
+}
+
+export async function getGlobalMixerSettings(): Promise<GlobalMixerSettings> {
+  if (cached && Date.now() - cachedAt < CACHE_TTL_MS) {
+    return cached;
+  }
+  if (inflight) {
+    return inflight;
+  }
+  const p = fetchGlobalMixerSettings();
+  inflight = p;
+  void p.finally(() => {
+    if (inflight === p) {
+      inflight = undefined;
+    }
+  });
+  return p;
 }
