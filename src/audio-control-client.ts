@@ -14,9 +14,11 @@ const REQUEST_TIMEOUT_MS = 3000;
 // real response resets it, another failure widens it (capped).
 const CONNECT_BACKOFF_BASE_MS = 1000;
 const CONNECT_BACKOFF_MAX_MS = 30000;
-// Consecutive request timeouts that mean the socket is open but the server has
-// stopped answering (that state emits no close event, so connect-failure
-// backoff alone never engages). At this many, tear the socket down and back off.
+// Consecutive request-timeout *episodes* that mean the socket is open but the
+// server has stopped answering (that state emits no close event, so
+// connect-failure backoff alone never engages). At this many, tear the socket
+// down and back off. See noteRequestTimeout for why this counts episodes rather
+// than individual requests.
 const REQUEST_TIMEOUT_TRIP = 3;
 
 export type AudioControlActivity = 2 | 3 | 4 | number;
@@ -72,13 +74,30 @@ export class AudioControlClient {
   private messageListeners = new Set<(event: any) => void>();
   private instancesCache?: { at: number; value: ApplicationInstance[] };
   private instancesInFlight?: Promise<ApplicationInstance[]>;
+  // Bumped by every write that makes the cached session list obsolete. A fetch
+  // records the generation it started at and refuses to install its result if
+  // the generation moved while it was in flight — see getApplicationInstances.
+  private instancesGeneration = 0;
+  private instancesInFlightGeneration = -1;
+  private deviceCache?: { at: number; value: SystemDefaultDevice };
+  private deviceInFlight?: Promise<SystemDefaultDevice>;
+  private deviceGeneration = 0;
+  private deviceInFlightGeneration = -1;
   // Circuit-breaker state (see CONNECT_BACKOFF_* and ensureConnected).
   // `connectBlockedUntil` is a timestamp before which lazy reconnects fast-fail;
   // `connectFailures` sizes the backoff; `requestTimeouts` counts consecutive
-  // unanswered requests so a hung-but-open server also trips it.
+  // unanswered request episodes so a hung-but-open server also trips it.
   private connectFailures = 0;
   private connectBlockedUntil = 0;
   private requestTimeouts = 0;
+  private lastRequestTimeoutAt = 0;
+  // Offline/online transition tracking. Every caller of this client swallows its
+  // errors (the keys just paint the offline glyph), so without this the plugin
+  // can spend hours unreachable and write nothing to the log — which is exactly
+  // what made "it dies when a game starts" impossible to diagnose after the fact.
+  private online = true;
+  private offlineSince = 0;
+  private offlineReason = "";
 
   async connect(): Promise<void> {
     // A deliberate connect (plugin startup, or the restart-server recovery
@@ -104,6 +123,7 @@ export class AudioControlClient {
     this.connectFailures = 0;
     this.connectBlockedUntil = 0;
     this.requestTimeouts = 0;
+    this.lastRequestTimeoutAt = 0;
     if (socket) {
       try {
         socket.terminate();
@@ -113,6 +133,11 @@ export class AudioControlClient {
     }
   }
 
+  /** True while the breaker still considers the audio server reachable. */
+  isOnline(): boolean {
+    return this.online;
+  }
+
   onMessage(listener: (event: any) => void): () => void {
     this.messageListeners.add(listener);
     return () => {
@@ -120,8 +145,51 @@ export class AudioControlClient {
     };
   }
 
-  async getSystemDefaultDevice(): Promise<SystemDefaultDevice> {
-    return this.request<SystemDefaultDevice>("getSystemDefaultDevice", {});
+  /**
+   * The system default output device, cached for `maxAgeMs`.
+   *
+   * The default is 0 (always fresh) so accepting a stale reading has to be a
+   * deliberate choice: anything that computes a *new* value from the current
+   * one — a volume step — must never step off stale data. Painting a key can.
+   *
+   * This matters because one title refresh renders every placed key, and three
+   * of the keys on this profile target the master device. Uncached, a single
+   * repaint was three separate ~8ms round-trips, all serialized behind the
+   * server's one COM thread, for a value that cannot have changed between them.
+   */
+  async getSystemDefaultDevice(maxAgeMs = 0): Promise<SystemDefaultDevice> {
+    const cache = this.deviceCache;
+    if (cache && Date.now() - cache.at < maxAgeMs) {
+      return cache.value;
+    }
+
+    if (this.deviceInFlight && this.deviceInFlightGeneration === this.deviceGeneration) {
+      return this.deviceInFlight;
+    }
+
+    const generation = this.deviceGeneration;
+    this.deviceInFlightGeneration = generation;
+    const fetch = (async () => {
+      try {
+        const device = await this.request<SystemDefaultDevice>("getSystemDefaultDevice", {});
+        if (this.deviceGeneration === generation) {
+          this.deviceCache = { at: Date.now(), value: device };
+        }
+        return device;
+      } finally {
+        if (this.deviceInFlightGeneration === generation) {
+          this.deviceInFlight = undefined;
+        }
+      }
+    })();
+    this.deviceInFlight = fetch;
+    return fetch;
+  }
+
+  /** Drops the cached device so the next read reflects a just-made change. */
+  invalidateDeviceCache(): void {
+    this.deviceCache = undefined;
+    this.deviceGeneration += 1;
   }
 
   async setSystemDefaultDeviceVolume(volume: number): Promise<void> {
@@ -129,6 +197,7 @@ export class AudioControlClient {
       processID: 0,
       volume: clampVolume(volume),
     });
+    this.invalidateDeviceCache();
   }
 
   async setSystemDefaultDeviceMute(mute: boolean): Promise<void> {
@@ -136,6 +205,7 @@ export class AudioControlClient {
       processID: 0,
       mute,
     });
+    this.invalidateDeviceCache();
   }
 
   async getApplicationInstanceCount(): Promise<number> {
@@ -153,6 +223,12 @@ export class AudioControlClient {
    * to N keys × (count + N index) WebSocket round-trips and swamp the server.
    * Concurrent callers share one in-flight fetch; `maxAgeMs` lets callers that
    * need fresh data (e.g. right before a key acts) bypass the cache.
+   *
+   * The generation guard is what stops a held volume key from stalling. A fetch
+   * that started *before* a write used to install its pre-write snapshot
+   * *after* the write had invalidated the cache, so the next step computed
+   * "current + step" from the stale reading and re-sent the value the key
+   * already had. Held down, the volume simply stopped moving.
    */
   async getApplicationInstances(maxAgeMs = 1000): Promise<ApplicationInstance[]> {
     const cache = this.instancesCache;
@@ -160,11 +236,15 @@ export class AudioControlClient {
       return cache.value;
     }
 
-    if (this.instancesInFlight) {
+    // Only join an in-flight fetch started at the current generation; an older
+    // one is already known to be reading pre-write state.
+    if (this.instancesInFlight && this.instancesInFlightGeneration === this.instancesGeneration) {
       return this.instancesInFlight;
     }
 
-    this.instancesInFlight = (async () => {
+    const generation = this.instancesGeneration;
+    this.instancesInFlightGeneration = generation;
+    const fetch = (async () => {
       try {
         const count = await this.getApplicationInstanceCount();
         // Read every index concurrently rather than sequentially: the count call
@@ -182,19 +262,26 @@ export class AudioControlClient {
             streamDeck.logger.warn(`Failed to read application instance: ${String(result.reason)}`);
           }
         }
-        this.instancesCache = { at: Date.now(), value: instances };
+        if (this.instancesGeneration === generation) {
+          this.instancesCache = { at: Date.now(), value: instances };
+        }
         return instances;
       } finally {
-        this.instancesInFlight = undefined;
+        // Don't clear a newer fetch that has already replaced this one.
+        if (this.instancesInFlightGeneration === generation) {
+          this.instancesInFlight = undefined;
+        }
       }
     })();
+    this.instancesInFlight = fetch;
 
-    return this.instancesInFlight;
+    return fetch;
   }
 
   /** Drops the cached session list so the next read reflects a just-made change. */
   invalidateInstancesCache(): void {
     this.instancesCache = undefined;
+    this.instancesGeneration += 1;
   }
 
   async setApplicationInstanceMute(processID: number, mute: boolean): Promise<void> {
@@ -289,7 +376,7 @@ export class AudioControlClient {
         cleanupStartupListeners();
         this.connectPromise = undefined;
         this.socket = undefined;
-        this.noteConnectFailure();
+        this.noteConnectFailure(String(error));
         reject(error);
       };
 
@@ -297,7 +384,7 @@ export class AudioControlClient {
         cleanupStartupListeners();
         this.connectPromise = undefined;
         this.socket = undefined;
-        this.noteConnectFailure();
+        this.noteConnectFailure("socket closed before the connection completed");
         reject(new Error("Audio Control WebSocket closed before connection completed."));
       };
 
@@ -366,36 +453,79 @@ export class AudioControlClient {
 
   /** Server answered: clear the breaker so the next request goes through clean. */
   private noteHealthy(): void {
+    if (!this.online) {
+      const seconds = ((Date.now() - this.offlineSince) / 1000).toFixed(1);
+      streamDeck.logger.warn(
+        `Audio server reachable again after ${seconds}s offline (first failure: ${this.offlineReason}).`,
+      );
+      this.online = true;
+    }
     this.connectFailures = 0;
     this.connectBlockedUntil = 0;
     this.requestTimeouts = 0;
+    this.lastRequestTimeoutAt = 0;
   }
 
   /** A connect attempt failed: grow the backoff window (capped). */
-  private noteConnectFailure(): void {
+  private noteConnectFailure(reason: string): void {
     this.connectFailures += 1;
     const backoff = Math.min(
       CONNECT_BACKOFF_MAX_MS,
       CONNECT_BACKOFF_BASE_MS * 2 ** (this.connectFailures - 1),
     );
     this.connectBlockedUntil = Date.now() + backoff;
+    this.noteOffline(reason, backoff);
   }
 
   /**
-   * A request timed out. Enough consecutive timeouts means the socket is open
-   * but the server has stopped answering (a hang, which fires no close event),
-   * so tear the socket down and back off as if the connect had failed. Guarded
-   * on a live socket so a whole batch of simultaneous timeouts trips only once.
+   * Records — and logs, on the transition — that the server is unreachable.
+   * Every caller of this client swallows its errors and just paints the offline
+   * glyph, so this is the only place an outage leaves a trace. Logging the
+   * transition (rather than each failure) keeps a long outage to two lines.
+   */
+  private noteOffline(reason: string, backoffMs: number): void {
+    const retryIn = (backoffMs / 1000).toFixed(1);
+    if (this.online) {
+      this.online = false;
+      this.offlineSince = Date.now();
+      this.offlineReason = reason;
+      streamDeck.logger.warn(
+        `Audio server went offline — keys will paint the offline glyph. Reason: ${reason}. Retrying in ${retryIn}s.`,
+      );
+      return;
+    }
+    streamDeck.logger.warn(
+      `Audio server still offline after ${this.connectFailures} attempt(s): ${reason}. Next retry in ${retryIn}s.`,
+    );
+  }
+
+  /**
+   * A request timed out. Enough consecutive timeout *episodes* mean the socket
+   * is open but the server has stopped answering (a hang, which fires no close
+   * event), so tear the socket down and back off as if the connect had failed.
+   *
+   * Episodes, not requests: a session read goes out as one count call plus N
+   * index calls sharing a single deadline, so one slow moment on the server
+   * times every one of them out within milliseconds of each other. Counting
+   * those individually meant a *single* stutter supplied the whole
+   * REQUEST_TIMEOUT_TRIP budget and dropped the connection for up to 30s — the
+   * keys went dead on the first hiccup of a game launch. Timeouts closer
+   * together than one request deadline are therefore one failure.
    */
   private noteRequestTimeout(): void {
     if (!this.socket) {
       return;
     }
-    this.requestTimeouts += 1;
+    const now = Date.now();
+    if (now - this.lastRequestTimeoutAt > REQUEST_TIMEOUT_MS) {
+      this.requestTimeouts += 1;
+    }
+    this.lastRequestTimeoutAt = now;
     if (this.requestTimeouts < REQUEST_TIMEOUT_TRIP) {
       return;
     }
     this.requestTimeouts = 0;
+    this.lastRequestTimeoutAt = 0;
     const socket = this.socket;
     this.socket = undefined;
     this.connectPromise = undefined;
@@ -404,7 +534,9 @@ export class AudioControlClient {
     } catch {
       // Already gone — nothing to do.
     }
-    this.noteConnectFailure();
+    this.noteConnectFailure(
+      `${REQUEST_TIMEOUT_TRIP} request-timeout episodes (socket open, server not answering)`,
+    );
   }
 }
 

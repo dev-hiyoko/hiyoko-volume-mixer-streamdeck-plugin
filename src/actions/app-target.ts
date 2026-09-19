@@ -1,6 +1,6 @@
 import type { ApplicationInstance } from "../audio-control-client.js";
 import { audioControlClient } from "../audio-control-client.js";
-import { appNameKey, getAutoAppGroups } from "../auto-app-state.js";
+import { appNameKey, getAutoAppGroups, type AutoAppGroup } from "../auto-app-state.js";
 
 export { appNameKey };
 
@@ -32,14 +32,26 @@ export async function resolveApplicationTargetGroup(
   settings: AppTargetSettings,
 ): Promise<ResolvedTargetGroup | undefined> {
   const slot = Math.max(0, Number(settings.slot ?? 0));
-  const groups = getAutoAppGroups(await audioControlClient.getApplicationInstances(), {
+  const group = (await listApplicationTargetGroups(settings))[slot];
+  return group ? { representative: group.representative, instances: group.instances, label: group.label } : undefined;
+}
+
+/**
+ * The whole slot-ordered group list that `resolveApplicationTargetGroup` picks
+ * a single slot out of.
+ *
+ * A key that acts needs both: the group it targets, *and* which other placed
+ * keys point at that same group, so they can be repainted from the value just
+ * computed instead of waiting for the next poll. Taking the list once gives
+ * both from one read.
+ */
+export async function listApplicationTargetGroups(settings: AppTargetSettings): Promise<AutoAppGroup[]> {
+  return getAutoAppGroups(await audioControlClient.getApplicationInstances(), {
     showApps: settings.showApps ?? "active",
     groupDuplicates: settings.groupDuplicates ?? true,
     order: settings.order ?? [],
     aliases: settings.aliases ?? {},
   });
-  const group = groups[slot];
-  return group ? { representative: group.representative, instances: group.instances, label: group.label } : undefined;
 }
 
 /** Ordered slot → app-name-key list for the Property Inspector preview. */

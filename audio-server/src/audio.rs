@@ -103,6 +103,31 @@ pub fn run_audio_thread(rx: Receiver<Cmd>) {
     }
 }
 
+/// How long a resolved endpoint may be reused before it is looked up again.
+///
+/// Every command used to re-run GetDefaultAudioEndpoint and re-Activate the
+/// session manager (or the endpoint volume) from scratch. Measured on an idle
+/// machine, that fixed setup — not the per-session work — was what each command
+/// cost: reading 9 sessions took 8.6ms, and so did setting one volume, which
+/// touches almost no session data. A held volume key issues roughly eight
+/// commands a second, so this is the cost that matters.
+///
+/// The window is the staleness budget: if the user switches their default output
+/// device, commands keep going to the previous one for at most this long.
+const ENDPOINT_TTL: Duration = Duration::from_millis(1000);
+
+/// The default output endpoint and everything derived from it that cannot
+/// change while it remains the default.
+struct CachedEndpoint {
+    // The device itself is not retained: `manager` and `endpoint_volume` were
+    // activated from it and hold their own references to what they need.
+    manager: IAudioSessionManager2,
+    endpoint_volume: IAudioEndpointVolume,
+    device_id: String,
+    friendly_name: String,
+    at: Instant,
+}
+
 struct Engine {
     enumerator: IMMDeviceEnumerator,
     instance_to_id: HashMap<String, u32>,
@@ -111,6 +136,22 @@ struct Engine {
     /// Instance id -> the last time we saw that session Active. Drives the
     /// recently-active grace window.
     last_active: HashMap<String, Instant>,
+    endpoint: Option<CachedEndpoint>,
+    /// Instance id -> the owning process's image path.
+    ///
+    /// Reading it means opening a handle on another process
+    /// (OpenProcess + QueryFullProcessImageNameW) and the answer cannot change
+    /// for the life of a session, yet it was re-read for every session on every
+    /// enumeration — several times a second. It is also the one call here that
+    /// reaches into a *game's* process, which is both the slowest case and the
+    /// one most likely to be interfered with, so not making it is worth more
+    /// than the microseconds suggest. Keyed by the session instance identifier,
+    /// not the pid, because pids are recycled and instance identifiers are not.
+    process_image: HashMap<String, String>,
+    /// Resolved "@dll,-123" indirect display strings. Resolving one loads a
+    /// resource out of a DLL through the shell; the result is a pure function of
+    /// the input, so it is worth remembering across enumerations.
+    indirect_names: HashMap<String, String>,
 }
 
 impl Engine {
@@ -123,6 +164,9 @@ impl Engine {
             id_to_instance: HashMap::new(),
             next_id: FIRST_SYNTHETIC_ID,
             last_active: HashMap::new(),
+            endpoint: None,
+            process_image: HashMap::new(),
+            indirect_names: HashMap::new(),
         })
     }
 
@@ -137,57 +181,102 @@ impl Engine {
         id
     }
 
-    fn default_device(&self) -> Option<IMMDevice> {
-        unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.ok()
+    /// Resolves the default endpoint, reusing the previous result for up to
+    /// ENDPOINT_TTL. Returns None if there is no default output device.
+    fn endpoint(&mut self) -> Option<&CachedEndpoint> {
+        let fresh = self
+            .endpoint
+            .as_ref()
+            .is_some_and(|cached| cached.at.elapsed() < ENDPOINT_TTL);
+        if fresh {
+            return self.endpoint.as_ref();
+        }
+
+        self.endpoint = None;
+        let device = unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.ok()?;
+        let manager: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None) }.ok()?;
+        let endpoint_volume: IAudioEndpointVolume = unsafe { device.Activate(CLSCTX_ALL, None) }.ok()?;
+        // The id and the friendly name are fixed for as long as this device is
+        // the default, so they are resolved once per cache fill rather than on
+        // every getSystemDefaultDevice.
+        let device_id = take_pwstr_result(unsafe { device.GetId() });
+        let friendly_name = unsafe { friendly_name(&device) };
+        self.endpoint = Some(CachedEndpoint {
+            manager,
+            endpoint_volume,
+            device_id,
+            friendly_name,
+            at: Instant::now(),
+        });
+        self.endpoint.as_ref()
     }
 
-    fn default_device_info(&self) -> Option<DeviceInfo> {
-        let dev = self.default_device()?;
-        unsafe {
-            let device_id = take_pwstr_result(dev.GetId());
-            let friendly_name = friendly_name(&dev);
-            let epv: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
-            let volume = epv.GetMasterVolumeLevelScalar().unwrap_or(0.0);
-            let mute = epv.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-            Some(DeviceInfo {
+    /// Forces the next command to resolve the endpoint again. Called whenever a
+    /// cached interface returns an error, which is how a device that went away
+    /// (unplugged, disabled, or replaced as the default) gets noticed before the
+    /// TTL would have expired.
+    fn drop_endpoint(&mut self) {
+        self.endpoint = None;
+    }
+
+    fn default_device_info(&mut self) -> Option<DeviceInfo> {
+        let cached = self.endpoint()?;
+        let device_id = cached.device_id.clone();
+        let friendly_name = cached.friendly_name.clone();
+        let volume = unsafe { cached.endpoint_volume.GetMasterVolumeLevelScalar() };
+        let mute = unsafe { cached.endpoint_volume.GetMute() };
+        match (volume, mute) {
+            (Ok(volume), Ok(mute)) => Some(DeviceInfo {
                 device_id,
                 friendly_name,
-                mute,
+                mute: mute.as_bool(),
                 volume,
-            })
-        }
-    }
-
-    fn set_default_volume(&self, v: f32) {
-        if let Some(dev) = self.default_device() {
-            unsafe {
-                if let Ok(epv) = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-                    let _ = epv.SetMasterVolumeLevelScalar(v.clamp(0.0, 1.0), std::ptr::null());
-                }
+            }),
+            _ => {
+                // The cached endpoint is no longer usable — drop it so the next
+                // call resolves a live one instead of failing again.
+                self.drop_endpoint();
+                None
             }
         }
     }
 
-    fn set_default_mute(&self, m: bool) {
-        if let Some(dev) = self.default_device() {
-            unsafe {
-                if let Ok(epv) = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
-                    let _ = epv.SetMute(BOOL::from(m), std::ptr::null());
-                }
-            }
+    fn set_default_volume(&mut self, v: f32) {
+        let Some(cached) = self.endpoint() else {
+            return;
+        };
+        let result = unsafe {
+            cached
+                .endpoint_volume
+                .SetMasterVolumeLevelScalar(v.clamp(0.0, 1.0), std::ptr::null())
+        };
+        if result.is_err() {
+            self.drop_endpoint();
+        }
+    }
+
+    fn set_default_mute(&mut self, m: bool) {
+        let Some(cached) = self.endpoint() else {
+            return;
+        };
+        let result = unsafe { cached.endpoint_volume.SetMute(BOOL::from(m), std::ptr::null()) };
+        if result.is_err() {
+            self.drop_endpoint();
         }
     }
 
     fn sessions(&mut self) -> Vec<AppInstance> {
         let mut out = Vec::new();
-        let Some(dev) = self.default_device() else {
+        let mut seen: Vec<String> = Vec::new();
+        let Some(cached) = self.endpoint() else {
             return out;
         };
+        let mgr = cached.manager.clone();
         unsafe {
-            let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
-                return out;
-            };
             let Ok(en) = mgr.GetSessionEnumerator() else {
+                // A session manager that will not enumerate belongs to a device
+                // that is gone; resolve a fresh one next time.
+                self.drop_endpoint();
                 return out;
             };
             let count = en.GetCount().unwrap_or(0);
@@ -200,11 +289,21 @@ impl Engine {
                 if instance.is_empty() {
                     continue;
                 }
+                seen.push(instance.clone());
                 let id = self.id_for(&instance);
-                let pid = ctl2.GetProcessId().unwrap_or(0);
-                let exe_full = process_image(pid);
+                let exe_full = match self.process_image.get(&instance) {
+                    Some(path) => path.clone(),
+                    None => {
+                        let pid = ctl2.GetProcessId().unwrap_or(0);
+                        let path = process_image(pid);
+                        self.process_image.insert(instance.clone(), path.clone());
+                        path
+                    }
+                };
+                // Read live: unlike the image path, an app may update its own
+                // session display name while it runs.
                 let display_raw = take_pwstr_result(ctl2.GetDisplayName());
-                let display_name = resolve_name(&display_raw, &exe_full);
+                let display_name = self.resolve_name(&display_raw, &exe_full);
                 let (volume, mute) = match ctl.cast::<ISimpleAudioVolume>() {
                     Ok(sav) => (
                         sav.GetMasterVolume().unwrap_or(0.0),
@@ -247,10 +346,13 @@ impl Engine {
         // Drop stale entries so the map can't grow without bound as sessions
         // come and go; anything past the grace window is hidden anyway.
         self.last_active.retain(|_, t| t.elapsed() < RECENT_GRACE);
+        // Same for the image-path cache: keep only sessions this sweep saw, so
+        // it tracks the live session set rather than growing all day.
+        self.process_image.retain(|instance, _| seen.iter().any(|s| s == instance));
         out
     }
 
-    fn set_session_volume(&self, id: u32, v: f32) {
+    fn set_session_volume(&mut self, id: u32, v: f32) {
         self.with_session(id, |ctl| unsafe {
             if let Ok(sav) = ctl.cast::<ISimpleAudioVolume>() {
                 let _ = sav.SetMasterVolume(v.clamp(0.0, 1.0), std::ptr::null());
@@ -258,7 +360,7 @@ impl Engine {
         });
     }
 
-    fn set_session_mute(&self, id: u32, m: bool) {
+    fn set_session_mute(&mut self, id: u32, m: bool) {
         self.with_session(id, |ctl| unsafe {
             if let Ok(sav) = ctl.cast::<ISimpleAudioVolume>() {
                 let _ = sav.SetMute(BOOL::from(m), std::ptr::null());
@@ -269,18 +371,17 @@ impl Engine {
     /// Re-enumerates and runs `f` against the live session whose instance id
     /// matches the one this synthetic id was minted for. Sessions are recreated
     /// on every enumeration, so we always match by the stable instance string.
-    fn with_session<F: FnOnce(&IAudioSessionControl)>(&self, id: u32, f: F) {
-        let Some(target) = self.id_to_instance.get(&id) else {
+    fn with_session<F: FnOnce(&IAudioSessionControl)>(&mut self, id: u32, f: F) {
+        let Some(target) = self.id_to_instance.get(&id).cloned() else {
             return;
         };
-        let Some(dev) = self.default_device() else {
+        let Some(cached) = self.endpoint() else {
             return;
         };
+        let mgr = cached.manager.clone();
         unsafe {
-            let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
-                return;
-            };
             let Ok(en) = mgr.GetSessionEnumerator() else {
+                self.drop_endpoint();
                 return;
             };
             let count = en.GetCount().unwrap_or(0);
@@ -290,7 +391,7 @@ impl Engine {
                     continue;
                 };
                 let instance = take_pwstr_result(ctl2.GetSessionInstanceIdentifier());
-                if &instance == target {
+                if instance == target {
                     f(&ctl);
                     return;
                 }
@@ -310,26 +411,33 @@ unsafe fn friendly_name(dev: &IMMDevice) -> String {
     }
 }
 
-/// Resolves a session's shown name: an indirect resource string ("@dll,-id")
-/// resolves via the shell (giving e.g. "システム音"); a literal display name is
-/// used as-is; an empty one falls back to the executable name without ".exe".
-fn resolve_name(display_raw: &str, exe_full: &str) -> String {
-    if let Some(stripped) = display_raw.strip_prefix('@') {
-        let _ = stripped;
-        if let Some(resolved) = unsafe { sh_load_indirect(display_raw) } {
-            if !resolved.is_empty() {
-                return resolved;
+impl Engine {
+    /// Resolves a session's shown name: an indirect resource string ("@dll,-id")
+    /// resolves via the shell (giving e.g. "システム音"); a literal display name is
+    /// used as-is; an empty one falls back to the executable name without ".exe".
+    ///
+    /// Indirect strings are resolved once and remembered — the lookup loads a
+    /// resource out of a DLL and the answer only depends on the string.
+    fn resolve_name(&mut self, display_raw: &str, exe_full: &str) -> String {
+        if display_raw.starts_with('@') {
+            if let Some(cached) = self.indirect_names.get(display_raw) {
+                return cached.clone();
             }
+            let resolved = unsafe { sh_load_indirect(display_raw) }
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| String::from("システム音"));
+            self.indirect_names
+                .insert(display_raw.to_string(), resolved.clone());
+            return resolved;
         }
-        return String::from("システム音");
-    }
-    if !display_raw.is_empty() {
-        return display_raw.to_string();
-    }
-    let base = basename(exe_full);
-    match base.rsplit_once('.') {
-        Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),
-        _ => base,
+        if !display_raw.is_empty() {
+            return display_raw.to_string();
+        }
+        let base = basename(exe_full);
+        match base.rsplit_once('.') {
+            Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),
+            _ => base,
+        }
     }
 }
 

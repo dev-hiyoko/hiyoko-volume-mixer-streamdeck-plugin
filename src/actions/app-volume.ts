@@ -12,6 +12,7 @@ import type { JsonObject, JsonValue } from "@elgato/utils";
 
 import { audioControlClient, clampVolume } from "../audio-control-client.js";
 import {
+  flushSavedAutoAppState,
   getAutoAppStateKey,
   mirrorSavedAutoAppState,
   scheduleAutoAppSync,
@@ -19,7 +20,12 @@ import {
 } from "../auto-app-state.js";
 import { getGlobalMixerSettings } from "../global-settings.js";
 import { renderKeyImage } from "../key-image.js";
-import { appNameKey, listDetectedAppNames, resolveApplicationTargetGroup } from "./app-target.js";
+import {
+  appNameKey,
+  listApplicationTargetGroups,
+  listDetectedAppNames,
+  resolveApplicationTargetGroup,
+} from "./app-target.js";
 
 type MixerRole = "volume-up" | "volume-down" | "mute-toggle";
 
@@ -53,6 +59,10 @@ const REPEAT_INTERVAL_MS = 130;
 // hitting 0 or 100% also stops it (see startHold), so these are just backstops.
 const MAX_REPEATS = 80;
 const MAX_HOLD_MS = 8000;
+// How stale a master-device reading may be when it is only being drawn. Matches
+// the session list's own cache window so master and per-app keys in one repaint
+// show data of the same age.
+const MASTER_RENDER_MAX_AGE_MS = 1000;
 
 @action({ UUID: "fun.hiyoko.volumemixer.app-volume" })
 export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
@@ -78,6 +88,17 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   // settings only change on appear / reconfigure, so serve them from this cache
   // and never round-trip on the hot path.
   private settingsCache = new Map<string, AppMixerSettings>();
+  // Guards against overlapping full-profile repaints. scheduleTitleRefresh
+  // clears its timer before starting the work, so a refresh arriving while a
+  // slow one is still running used to start a second one on top of it — and
+  // under load they stacked, each fanning out to every placed key. Collapse
+  // them: one runs, at most one more is remembered as pending.
+  private refreshInFlight = false;
+  private refreshQueued = false;
+  // Slot index -> app group label, from the last group list that was read.
+  // Lets a key that just acted find the other keys aimed at the same app
+  // without a second trip to the audio server. See paintGroupKeys.
+  private slotLabels: string[] = [];
 
   constructor() {
     super();
@@ -155,18 +176,37 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       return;
     }
 
+    let sessionsRead = false;
     try {
       // Force a fresh read so detection / drift-correction isn't masked by the cache.
       await audioControlClient.getApplicationInstances(0);
-      // Re-apply saved per-device volume/mute every cycle, not just when the app
-      // set changes. Some apps reset their own session to 100% shortly after
-      // launch (notably right after a PC restart), and a one-shot restore on
-      // appearance loses that race — the PID set never changes again, so the app
-      // stays at 100%. The sync only sends a change when the live value actually
-      // deviates from the saved value, so an unchanged set is near free.
+      sessionsRead = true;
+    } catch (error) {
+      // An outage itself is logged once by the client, on the transition — so
+      // don't repeat it every 1.5s here. A failure the client does *not*
+      // attribute to an outage is new information, and that one gets recorded.
+      //
+      // This used to be a bare `catch {}` with the sync call inside the `try`,
+      // which meant an unreachable server skipped the only code path that logged
+      // anything at all: the plugin could sit offline for a week and leave the
+      // log file empty. That is why "it breaks when a game launches" had no
+      // evidence behind it.
+      if (audioControlClient.isOnline()) {
+        streamDeck.logger.warn(`Poll could not read audio sessions: ${String(error)}`);
+      }
+    }
+
+    // Re-apply saved per-device volume/mute every cycle, not just when the app
+    // set changes. Some apps reset their own session to 100% shortly after
+    // launch (notably right after a PC restart), and a one-shot restore on
+    // appearance loses that race — the PID set never changes again, so the app
+    // stays at 100%. The sync only sends a change when the live value actually
+    // deviates from the saved value, so an unchanged set is near free.
+    //
+    // Skipped while the server is unreachable: the sweep would only fail, and
+    // it logs per attempt.
+    if (sessionsRead) {
       scheduleAutoAppSync();
-    } catch {
-      // Ignore — server may be offline; titles will show that.
     }
 
     this.scheduleTitleRefresh();
@@ -179,12 +219,35 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
     }
     this.titleTimer = setTimeout(() => {
       this.titleTimer = undefined;
-      // A settings/device read here can reject on a server timeout; catch it so
-      // it can't become an unhandled rejection that kills the plugin process.
-      this.updateVisibleTitles().catch((error) => {
-        streamDeck.logger.warn(`Title refresh failed: ${String(error)}`);
-      });
+      void this.runTitleRefresh();
     }, 150);
+  }
+
+  /**
+   * Runs one full-profile repaint at a time. A refresh that arrives while one
+   * is running is remembered, not started — otherwise a slow repaint (every key
+   * waiting on a server that has gone sluggish) accumulates overlapping copies,
+   * each pushing an image for every placed key into the Stream Deck host.
+   */
+  private async runTitleRefresh(): Promise<void> {
+    if (this.refreshInFlight) {
+      this.refreshQueued = true;
+      return;
+    }
+
+    this.refreshInFlight = true;
+    try {
+      do {
+        this.refreshQueued = false;
+        // A settings/device read here can reject on a server timeout; catch it so
+        // it can't become an unhandled rejection that kills the plugin process.
+        await this.updateVisibleTitles();
+      } while (this.refreshQueued);
+    } catch (error) {
+      streamDeck.logger.warn(`Title refresh failed: ${String(error)}`);
+    } finally {
+      this.refreshInFlight = false;
+    }
   }
 
   override async onWillAppear(ev: WillAppearEvent<AppMixerSettings>): Promise<void> {
@@ -235,6 +298,9 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
   override async onKeyUp(ev: KeyUpEvent<AppMixerSettings>): Promise<void> {
     this.pressed.delete(ev.action.id);
     this.stopHold(ev.action.id);
+    // The saved volume is buffered while the key repeats; push it out now that
+    // the adjustment is finished rather than waiting for the debounce.
+    await flushSavedAutoAppState();
   }
 
   override async onWillDisappear(ev: WillDisappearEvent<AppMixerSettings>): Promise<void> {
@@ -298,11 +364,14 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
     const global = await getGlobalMixerSettings();
 
     if (settings.master) {
-      const device = await audioControlClient.getSystemDefaultDevice();
+      // maxAgeMs 0: the next value is computed from this one, so it must never
+      // be a stale reading — otherwise the step is taken from the wrong base and
+      // the volume jumps back.
+      const device = await audioControlClient.getSystemDefaultDevice(0);
       if (role === "mute-toggle") {
         const muted = !device.mute;
         await audioControlClient.setSystemDefaultDeviceMute(muted);
-        await this.showImage(view, renderKeyImage({ kind: "mute", name: "マスター", muted }));
+        await this.paintMasterKeys(muted, device.volume);
         return undefined;
       }
       // Changing the volume implies the user wants to hear it: lift mute.
@@ -311,20 +380,23 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       }
       const nextVolume = clampVolume(device.volume + (role === "volume-down" ? -global.step : global.step));
       await audioControlClient.setSystemDefaultDeviceVolume(nextVolume);
-      await this.showImage(
-        view,
-        renderKeyImage({ kind: "volume", direction: role === "volume-down" ? "down" : "up", name: "マスター", percent: nextVolume * 100 }),
-      );
+      // Mute was lifted above if it had been on, so every master key now shows
+      // unmuted at the new level.
+      await this.paintMasterKeys(false, nextVolume);
       return nextVolume;
     }
 
-    const target = await resolveApplicationTargetGroup({
+    const groups = await listApplicationTargetGroups({
       slot: settings.slot,
       showApps: global.showApps,
       groupDuplicates: global.groupDuplicates,
       order: global.order,
       aliases: global.aliases,
     });
+    // Remember which app sits in which slot so the repaint below can find the
+    // other keys pointed at this same app without going back to the server.
+    this.slotLabels = groups.map((group) => group.label);
+    const target = groups[Math.max(0, Number(settings.slot ?? 0))];
     if (!target) {
       // Empty slot: nothing to control yet, but the key stays placed and will
       // pick up an app as soon as one occupies this slot.
@@ -346,7 +418,13 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
         instances.map((instance) => audioControlClient.setApplicationInstanceMute(instance.processID, nextMute)),
       );
       await updateSavedAutoAppState(primaryKey, { mute: nextMute });
-      await this.showImage(view, renderKeyImage({ kind: "mute", name, muted: nextMute, count, icon: global.icons[nameKey] }));
+      await this.paintGroupKeys(target.label, {
+        name,
+        count,
+        icon: global.icons[nameKey],
+        muted: nextMute,
+        volume: representative.volume,
+      });
     } else {
       const nextVolume = clampVolume(representative.volume + (role === "volume-down" ? -global.step : global.step));
       // Changing the volume implies the user wants to hear it: lift mute.
@@ -361,15 +439,86 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       }
       // Persist mute:false too, or the per-poll sync would re-apply the old mute.
       await updateSavedAutoAppState(primaryKey, wasMuted ? { volume: nextVolume, mute: false } : { volume: nextVolume });
-      await this.showImage(
-        view,
-        renderKeyImage({ kind: "volume", direction: role === "volume-down" ? "down" : "up", name, percent: nextVolume * 100, count }),
-      );
+      await this.paintGroupKeys(target.label, {
+        name,
+        count,
+        icon: global.icons[nameKey],
+        muted: wasMuted ? false : representative.mute,
+        volume: nextVolume,
+      });
       result = nextVolume;
     }
 
     await mirrorSavedAutoAppState(primaryKey, secondaryKey);
     return result;
+  }
+
+  /**
+   * Repaints every placed key that targets `label` from the value just written.
+   *
+   * A volume fader is drawn across two keys — ＋ is the top half, − the bottom
+   * half — and the same app can also have a mute key, so acting on one key
+   * changes what several of them should show. Only the pressed key was
+   * repainted, which left its partner showing the old knob position until the
+   * next poll: up to the poll interval (1.5s by default) of visible lag on a
+   * key the user is looking straight at.
+   *
+   * Slot ownership comes from `slotLabels`, recorded by the caller from the
+   * group list it had already read, so this costs no extra server traffic — the
+   * obvious alternative (kick off a title refresh) re-reads the session list on
+   * every repeat of a held key and races the write that just happened.
+   */
+  private async paintGroupKeys(
+    label: string,
+    state: { name: string; count: number; icon?: string; muted: boolean; volume: number },
+  ): Promise<void> {
+    await Promise.all(
+      this.actions.map(async (actionInstance) => {
+        const settings = this.settingsCache.get(actionInstance.id);
+        if (!settings || settings.master) {
+          return;
+        }
+        const slot = Math.max(0, Number(settings.slot ?? 0));
+        if (this.slotLabels[slot] !== label) {
+          return;
+        }
+        const role = normalizeRole(settings.role);
+        const image =
+          role === "mute-toggle"
+            ? renderKeyImage({ kind: "mute", name: state.name, muted: state.muted, count: state.count, icon: state.icon })
+            : renderKeyImage({
+                kind: "volume",
+                direction: role === "volume-down" ? "down" : "up",
+                name: state.name,
+                percent: state.volume * 100,
+                count: state.count,
+              });
+        await this.showImage(actionInstance, image);
+      }),
+    );
+  }
+
+  /** The master-device equivalent of paintGroupKeys. */
+  private async paintMasterKeys(muted: boolean, volume: number): Promise<void> {
+    await Promise.all(
+      this.actions.map(async (actionInstance) => {
+        const settings = this.settingsCache.get(actionInstance.id);
+        if (!settings?.master) {
+          return;
+        }
+        const role = normalizeRole(settings.role);
+        const image =
+          role === "mute-toggle"
+            ? renderKeyImage({ kind: "mute", name: "マスター", muted })
+            : renderKeyImage({
+                kind: "volume",
+                direction: role === "volume-down" ? "down" : "up",
+                name: "マスター",
+                percent: volume * 100,
+              });
+        await this.showImage(actionInstance, image);
+      }),
+    );
   }
 
   /** Draws the key as a glyph image (speaker / mute slash / volume ±). */
@@ -378,7 +527,10 @@ export class AppVolumeAction extends SingletonAction<AppMixerSettings> {
       const role = normalizeRole(settings.role);
 
       if (settings.master) {
-        const device = await audioControlClient.getSystemDefaultDevice();
+        // Painting only — a reading this fresh is plenty, and this runs once per
+        // master key per refresh (three of them on this profile), each otherwise
+        // a separate round-trip serialized behind the server's single COM thread.
+        const device = await audioControlClient.getSystemDefaultDevice(MASTER_RENDER_MAX_AGE_MS);
         const image =
           role === "mute-toggle"
             ? renderKeyImage({ kind: "mute", name: "マスター", muted: device.mute })

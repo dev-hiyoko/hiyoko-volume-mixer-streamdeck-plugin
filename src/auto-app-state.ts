@@ -30,10 +30,32 @@ let cachedState: GlobalAutoState | undefined;
 let cachedStateAt = 0;
 const STATE_TTL_MS = 3000;
 
-/** Hot-path read: cached copy of the global auto-state. */
+// Write coalescing. setGlobalSettings makes the Stream Deck host serialise and
+// persist the whole settings object to disk, on the same thread that drives its
+// UI. A held volume key steps every REPEAT_INTERVAL_MS (130ms) and each step
+// used to do two read+write pairs (updateSavedAutoAppState, then
+// mirrorSavedAutoAppState) — about fifteen settings files written per second
+// for as long as the key was down. That is survivable on an idle machine and
+// not survivable while a game is loading and saturating the disk: the host
+// stalls, which is what "Stream Deck freezes when I launch a game" is.
+//
+// So saves now mutate the in-memory copy and schedule one flush. A continuous
+// hold collapses from ~15 writes/second to at most one per FLUSH_MAX_WAIT_MS.
+const FLUSH_DEBOUNCE_MS = 400;
+const FLUSH_MAX_WAIT_MS = 2000;
+let flushTimer: NodeJS.Timeout | undefined;
+let dirtySince = 0;
+let flushInFlight: Promise<void> | undefined;
+
+/**
+ * Hot-path read: cached copy of the global auto-state.
+ *
+ * While a flush is pending the cache holds unsaved edits, so it must not be
+ * refreshed from the host — doing so would silently discard them.
+ */
 async function readGlobalAutoStateCached(): Promise<GlobalAutoState> {
   const now = Date.now();
-  if (cachedState && now - cachedStateAt < STATE_TTL_MS) {
+  if (cachedState && (dirtySince > 0 || now - cachedStateAt < STATE_TTL_MS)) {
     return cachedState;
   }
   cachedState = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
@@ -46,6 +68,84 @@ function rememberWrittenState(state: GlobalAutoState): void {
   cachedState = state;
   cachedStateAt = Date.now();
 }
+
+/**
+ * Persists our `devices` subtree, merged onto whatever the host currently holds.
+ *
+ * The global settings object is shared with global-settings.ts, which owns
+ * `detection`/`aliases`/`icons`/`order` and is written by the property
+ * inspector. Because our write is now deferred, the user may have edited those
+ * in the meantime — so re-read at flush time and merge, rather than writing back
+ * a snapshot taken before the edit. That read costs one round-trip per flush,
+ * not one per volume step.
+ */
+async function flushGlobalAutoState(): Promise<void> {
+  if (dirtySince === 0 || !cachedState) {
+    return;
+  }
+  dirtySince = 0;
+  const live = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
+  // Read our own subtree *after* the await: a key pressed while that read was in
+  // flight has already updated it, and capturing it earlier would write the
+  // pre-edit copy back over the new one.
+  const devices = cachedState?.devices ?? {};
+  const written: GlobalAutoState = { ...DEFAULT_GLOBAL_STATE, ...live, devices };
+  await streamDeck.settings.setGlobalSettings(written);
+  // Same hazard on the way out: if an edit landed during the write, the cache
+  // now holds something newer than what we just saved. Leave it alone — the
+  // edit already scheduled the follow-up flush that will persist it.
+  if (dirtySince === 0) {
+    rememberWrittenState(written);
+  }
+}
+
+/** Marks the in-memory state dirty and schedules a single coalesced write. */
+function scheduleGlobalAutoStateFlush(): void {
+  const now = Date.now();
+  if (dirtySince === 0) {
+    dirtySince = now;
+  }
+
+  // Cap the debounce: a key held down keeps resetting it, and a hold can run for
+  // MAX_HOLD_MS, so without this the save could be deferred for seconds.
+  if (now - dirtySince >= FLUSH_MAX_WAIT_MS) {
+    runFlush();
+    return;
+  }
+
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+  }
+  flushTimer = setTimeout(runFlush, FLUSH_DEBOUNCE_MS);
+}
+
+function runFlush(): void {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = undefined;
+  }
+  // Serialise flushes: two overlapping read-merge-write pairs could interleave
+  // and write back a half-merged object.
+  flushInFlight = (flushInFlight ?? Promise.resolve())
+    .then(() => flushGlobalAutoState())
+    .catch((error) => {
+      streamDeck.logger.warn(`Failed to save per-app volume state: ${String(error)}`);
+    });
+}
+
+/** Forces any buffered save out now (used when a key is released). */
+export async function flushSavedAutoAppState(): Promise<void> {
+  runFlush();
+  await flushInFlight;
+}
+
+// The default output device's id, used as the saved-state key. Reading it is a
+// round-trip to the audio server, and updateSavedAutoAppState/mirrorSaved... and
+// the drift sweep each wanted it — three per volume step. The id only changes
+// when the user switches their default output, so a short TTL is enough; the
+// cost of being briefly stale is that a volume change made within this window of
+// switching devices is saved under the previous device.
+const DEVICE_KEY_TTL_MS = 2000;
 
 let syncTimer: NodeJS.Timeout | undefined;
 
@@ -76,7 +176,7 @@ export function appNameKey(instance: ApplicationInstance): string {
 }
 
 export async function getAutoDeviceKey(): Promise<string> {
-  const device = await audioControlClient.getSystemDefaultDevice();
+  const device = await audioControlClient.getSystemDefaultDevice(DEVICE_KEY_TTL_MS);
   return device.deviceID || "default";
 }
 
@@ -175,51 +275,47 @@ export async function getAutoApplicationGroups(): Promise<AutoAppGroup[]> {
   });
 }
 
-export async function updateSavedAutoAppState(label: string, nextState: SavedAppState): Promise<void> {
+/** Applies `mutate` to the saved app map for the current device, in memory. */
+async function editSavedApps(mutate: (apps: Record<string, SavedAppState>) => boolean): Promise<void> {
   const deviceKey = await getAutoDeviceKey();
-  const state = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
+  const state = await readGlobalAutoStateCached();
   const devices = { ...(state.devices ?? {}) };
   const currentDeviceState = { ...(devices[deviceKey] ?? {}) };
   const apps = { ...(currentDeviceState.apps ?? {}) };
-  const current = apps[label] ?? {};
 
-  apps[label] = {
-    mute: nextState.mute ?? current.mute,
-    volume: nextState.volume ?? current.volume,
-  };
-
-  currentDeviceState.apps = apps;
-  devices[deviceKey] = currentDeviceState;
-  const written: GlobalAutoState = {
-    ...DEFAULT_GLOBAL_STATE,
-    ...state,
-    devices,
-  };
-  await streamDeck.settings.setGlobalSettings(written);
-  rememberWrittenState(written);
-}
-
-export async function mirrorSavedAutoAppState(sourceLabel: string, mirrorLabel: string): Promise<void> {
-  const deviceKey = await getAutoDeviceKey();
-  const state = (await streamDeck.settings.getGlobalSettings<GlobalAutoState>()) ?? DEFAULT_GLOBAL_STATE;
-  const saved = state.devices?.[deviceKey]?.apps?.[sourceLabel];
-  if (!saved) {
+  if (!mutate(apps)) {
     return;
   }
 
-  const devices = { ...(state.devices ?? {}) };
-  const currentDeviceState = { ...(devices[deviceKey] ?? {}) };
-  const apps = { ...(currentDeviceState.apps ?? {}) };
-  apps[mirrorLabel] = { ...saved };
   currentDeviceState.apps = apps;
   devices[deviceKey] = currentDeviceState;
-  const written: GlobalAutoState = {
-    ...DEFAULT_GLOBAL_STATE,
-    ...state,
-    devices,
-  };
-  await streamDeck.settings.setGlobalSettings(written);
-  rememberWrittenState(written);
+  // Hold the edit in memory and let the coalescing flush persist it; a held key
+  // makes one of these every 130ms and the host cannot absorb that as disk writes.
+  cachedState = { ...DEFAULT_GLOBAL_STATE, ...state, devices };
+  cachedStateAt = Date.now();
+  scheduleGlobalAutoStateFlush();
+}
+
+export async function updateSavedAutoAppState(label: string, nextState: SavedAppState): Promise<void> {
+  await editSavedApps((apps) => {
+    const current = apps[label] ?? {};
+    apps[label] = {
+      mute: nextState.mute ?? current.mute,
+      volume: nextState.volume ?? current.volume,
+    };
+    return true;
+  });
+}
+
+export async function mirrorSavedAutoAppState(sourceLabel: string, mirrorLabel: string): Promise<void> {
+  await editSavedApps((apps) => {
+    const saved = apps[sourceLabel];
+    if (!saved) {
+      return false;
+    }
+    apps[mirrorLabel] = { ...saved };
+    return true;
+  });
 }
 
 export async function getSavedAutoAppState(label: string): Promise<SavedAppState | undefined> {
