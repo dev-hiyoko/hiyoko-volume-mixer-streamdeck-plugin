@@ -34,7 +34,7 @@ export class RestartServerAction extends SingletonAction<RestartSettings> {
 
     let ok = false;
     try {
-      ok = await waitForServer(8000);
+      ok = await audioControlClient.waitUntilReachable(8000, 500);
     } catch (error) {
       streamDeck.logger.warn(`Audio server restart probe failed: ${String(error)}`);
     }
@@ -47,21 +47,6 @@ export class RestartServerAction extends SingletonAction<RestartSettings> {
   }
 }
 
-/** Polls the audio server until a connection succeeds or the timeout elapses. */
-async function waitForServer(timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await delay(500);
-    try {
-      await audioControlClient.connect();
-      return true;
-    } catch {
-      // Not up yet — keep polling.
-    }
-  }
-  return false;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// The reachability probe lives on the client now (waitUntilReachable): plugin
+// startup needs exactly the same thing, and two copies of "retry connect until
+// it answers" would drift apart.

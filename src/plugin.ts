@@ -28,8 +28,19 @@ streamDeck.actions.registerAction(new AppVolumeAction());
 streamDeck.actions.registerAction(new RestartServerAction());
 streamDeck.actions.registerAction(new AppleMusicAction());
 
-audioControlClient.connect().catch((error) => {
-  streamDeck.logger.warn(`Audio Control WebSocket is not ready yet: ${String(error)}`);
-});
+// The server was spawned a moment ago and needs a beat to bind its port, so
+// keep probing at a steady rate rather than letting a first failure put us on
+// the lazy-reconnect backoff ladder — that left every key showing the offline
+// glyph for up to ~22s after each Stream Deck start.
+audioControlClient
+  .waitUntilReachable(30000)
+  .then((reachable) => {
+    if (!reachable) {
+      streamDeck.logger.warn("Audio server did not become reachable within 30s of startup.");
+    }
+  })
+  .catch((error) => {
+    streamDeck.logger.warn(`Audio Control startup probe failed: ${String(error)}`);
+  });
 
 streamDeck.connect();

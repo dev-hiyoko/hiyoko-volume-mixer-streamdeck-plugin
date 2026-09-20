@@ -157,6 +157,36 @@ export class AudioControlClient {
     return this.online;
   }
 
+  /**
+   * Retries `connect()` at a steady interval until the server answers or
+   * `timeoutMs` elapses. Resolves to whether it came up.
+   *
+   * Used where we know the server is *expected* to appear shortly — plugin
+   * startup, which has just spawned it, and the restart key. The lazy
+   * reconnect's exponential backoff is wrong for both: it assumes repeated
+   * failures mean the server is gone, so after a handful of misses it waits
+   * seconds between attempts. At startup the plugin reliably outran its own
+   * server by a moment and then sat out the ladder — measured at 2.5s on a good
+   * run and 22.5s on a bad one, with every key showing the offline glyph for
+   * the duration. connect() clears the breaker on each attempt, so this keeps
+   * probing at a fixed rate instead.
+   */
+  async waitUntilReachable(timeoutMs: number, intervalMs = 400): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        await this.connect();
+        return true;
+      } catch {
+        // Not up yet.
+      }
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
   onMessage(listener: (event: any) => void): () => void {
     this.messageListeners.add(listener);
     return () => {
