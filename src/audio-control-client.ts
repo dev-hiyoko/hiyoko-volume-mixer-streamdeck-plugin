@@ -5,6 +5,10 @@ import WebSocket, { type RawData } from "ws";
 // server's 1844.
 const AUDIO_CONTROL_URL = "ws://127.0.0.1:1845";
 const REQUEST_TIMEOUT_MS = 3000;
+// Apple Music commands drive another app's UI and may have to launch it first.
+// Measured 2026-09-20: starting a playlist takes ~2.2s on a warm app, and the
+// server itself waits up to 20s for a cold launch.
+const APPLE_MUSIC_TIMEOUT_MS = 30000;
 
 // Reconnect backoff. The audio server may be briefly unavailable — during the
 // plugin's own startup before it has finished spawning, or across a manual
@@ -22,6 +26,21 @@ const CONNECT_BACKOFF_MAX_MS = 30000;
 const REQUEST_TIMEOUT_TRIP = 3;
 
 export type AudioControlActivity = 2 | 3 | 4 | number;
+
+export type ApplePlaylist = {
+  /** Apple's library database id; survives renaming the playlist. */
+  id: string;
+  name: string;
+};
+
+export type AppleMusicStatus = {
+  running: boolean;
+  connected: boolean;
+  playing: boolean;
+  paused: boolean;
+  title: string;
+  artist: string;
+};
 
 export type SystemDefaultDevice = {
   deviceID: string;
@@ -297,6 +316,38 @@ export class AudioControlClient {
     this.invalidateInstancesCache();
   }
 
+  // --- Apple Music ---------------------------------------------------------
+  // These are answered by a separate thread in the audio server and, unlike the
+  // volume calls, can legitimately take seconds (starting a playlist drives the
+  // app's UI, and may first have to launch it). They get their own, longer
+  // deadline so a slow-but-working command is not reported as a failure — and
+  // so it never feeds the breaker that the volume path shares.
+
+  async appleMusicStatus(): Promise<AppleMusicStatus> {
+    return this.request<AppleMusicStatus>("appleMusicStatus", {}, APPLE_MUSIC_TIMEOUT_MS);
+  }
+
+  async appleMusicListPlaylists(): Promise<ApplePlaylist[]> {
+    const result = await this.request<{ playlists: ApplePlaylist[] }>(
+      "appleMusicListPlaylists",
+      {},
+      APPLE_MUSIC_TIMEOUT_MS,
+    );
+    return result.playlists ?? [];
+  }
+
+  async appleMusicPlayPlaylist(id: string, name: string, shuffle: boolean): Promise<void> {
+    await this.request<null>("appleMusicPlayPlaylist", { id, name, shuffle }, APPLE_MUSIC_TIMEOUT_MS);
+  }
+
+  async appleMusicResume(): Promise<void> {
+    await this.request<null>("appleMusicResume", {}, APPLE_MUSIC_TIMEOUT_MS);
+  }
+
+  async appleMusicPause(): Promise<void> {
+    await this.request<null>("appleMusicPause", {}, APPLE_MUSIC_TIMEOUT_MS);
+  }
+
   private async requestNoResponse(method: string, params: Record<string, unknown>): Promise<void> {
     await this.ensureConnected();
 
@@ -310,7 +361,11 @@ export class AudioControlClient {
     this.socket?.send(JSON.stringify(payload));
   }
 
-  private async request<T>(method: string, params: Record<string, unknown>): Promise<T> {
+  private async request<T>(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+  ): Promise<T> {
     await this.ensureConnected();
 
     const id = this.nextId++;
@@ -324,9 +379,15 @@ export class AudioControlClient {
     const response = new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        this.noteRequestTimeout();
+        // Only the short-deadline calls feed the breaker. A slow Apple Music
+        // command says nothing about whether the audio server is healthy, and
+        // counting it would drop the volume keys offline for an unrelated
+        // reason.
+        if (timeoutMs === REQUEST_TIMEOUT_MS) {
+          this.noteRequestTimeout();
+        }
         reject(new Error(`Audio Control request timed out: ${method}`));
-      }, REQUEST_TIMEOUT_MS);
+      }, timeoutMs);
 
       this.pending.set(id, { method, resolve: resolve as (value: unknown) => void, reject, timeout });
     });

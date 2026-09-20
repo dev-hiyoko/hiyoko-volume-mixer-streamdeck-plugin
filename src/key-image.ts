@@ -20,7 +20,15 @@ export type KeyImageOptions =
   | { kind: "mute"; name: string; muted: boolean; count?: number; icon?: string }
   | { kind: "empty"; name: string }
   | { kind: "offline" }
-  | { kind: "restart"; status: "idle" | "working" | "ok" | "error" };
+  | { kind: "restart"; status: "idle" | "working" | "ok" | "error" }
+  | {
+      kind: "music";
+      /** Playlist name, or a placeholder when the key has not been configured. */
+      name: string;
+      shuffle: boolean;
+      /** "working" covers the ~2s a playlist start takes — see apple-music.ts. */
+      status: "unset" | "idle" | "playing" | "paused" | "working" | "error";
+    };
 
 /**
  * Monochrome glyphs selectable per app for the mute key, so same-looking app
@@ -156,7 +164,64 @@ function refreshGlyph(color: string): string {
   );
 }
 
+/** Play triangle / pause bars / a spinner-ish dot, centred like the other glyphs. */
+function transportGlyph(status: "unset" | "idle" | "playing" | "paused" | "working" | "error", color: string): string {
+  if (status === "playing") {
+    // Showing a pause symbol while playing: the glyph says what the next press
+    // does, which is what the user is deciding when they look at the key.
+    return `<g transform="translate(36,38)"><rect x="-11" y="-13" width="7.5" height="26" rx="2" fill="${color}"/><rect x="3.5" y="-13" width="7.5" height="26" rx="2" fill="${color}"/></g>`;
+  }
+  if (status === "working") {
+    return (
+      `<g transform="translate(36,38)">` +
+      `<circle cx="0" cy="0" r="13" fill="none" stroke="${TRACK}" stroke-width="4"/>` +
+      `<path d="M 0 -13 A 13 13 0 0 1 11 6" fill="none" stroke="${color}" stroke-width="4" stroke-linecap="round"/>` +
+      `</g>`
+    );
+  }
+  if (status === "error") {
+    return (
+      `<g transform="translate(36,38)">` +
+      `<line x1="-10" y1="-10" x2="10" y2="10" stroke="${color}" stroke-width="4.5" stroke-linecap="round"/>` +
+      `<line x1="10" y1="-10" x2="-10" y2="10" stroke="${color}" stroke-width="4.5" stroke-linecap="round"/>` +
+      `</g>`
+    );
+  }
+  return `<g transform="translate(36,38)"><path d="M -9 -13 L 13 0 L -9 13 Z" fill="${color}"/></g>`;
+}
+
+/** Crossing arrows, bottom-right, shown only when the key starts shuffled. */
+function shuffleBadge(active: boolean): string {
+  const c = active ? GREEN : FAINT;
+  return (
+    `<g transform="translate(58,20) scale(0.62)">` +
+    `<path d="M-12 -8 L-4 -8 L8 8 L14 8" fill="none" stroke="${c}" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>` +
+    `<path d="M-12 8 L-4 8 L8 -8 L14 -8" fill="none" stroke="${c}" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>` +
+    `<path d="M10 -13 L16 -8 L10 -3 Z" fill="${c}"/><path d="M10 3 L16 8 L10 13 Z" fill="${c}"/>` +
+    `</g>`
+  );
+}
+
 export function renderKeyImage(opts: KeyImageOptions): string {
+  if (opts.kind === "music") {
+    if (opts.status === "unset") {
+      return frame(nameText("プレイリスト") + transportGlyph("idle", FAINT) + bottomText("未設定", MUTED));
+    }
+    const color =
+      opts.status === "error" ? RED : opts.status === "working" ? AMBER : opts.status === "playing" ? GREEN : WHITE;
+    const caption =
+      opts.status === "error"
+        ? bottomText("失敗", RED, true)
+        : opts.status === "working"
+          ? bottomText("開始中…", AMBER)
+          : opts.status === "playing"
+            ? bottomText("再生中", GREEN)
+            : opts.status === "paused"
+              ? bottomText("一時停止", MUTED)
+              : bottomText(opts.shuffle ? "シャッフル" : "順番に", MUTED);
+    return frame(nameText(label(opts.name)) + shuffleBadge(opts.shuffle) + transportGlyph(opts.status, color) + caption);
+  }
+
   if (opts.kind === "offline") {
     return frame(speaker(FAINT, false) + bottomText("オフライン", MUTED));
   }

@@ -11,19 +11,25 @@ use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio::{AppInstance, Cmd};
+use crate::media::MediaCmd;
 
 pub struct AppState {
     tx: Sender<Cmd>,
+    /// Apple Music control. A separate channel to a separate thread: these
+    /// calls can block for seconds, and must never queue behind (or ahead of)
+    /// the audio commands.
+    media_tx: Sender<MediaCmd>,
     /// Snapshot taken on getApplicationInstanceCount and read by index, so a
     /// count+index burst from the plugin sees a consistent list.
     snapshot: Mutex<Vec<AppInstance>>,
 }
 
-pub async fn serve(addr: &str, tx: Sender<Cmd>) -> std::io::Result<()> {
+pub async fn serve(addr: &str, tx: Sender<Cmd>, media_tx: Sender<MediaCmd>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("hiyoko-audio-server listening on {addr}");
     let state = Arc::new(AppState {
         tx,
+        media_tx,
         snapshot: Mutex::new(Vec::new()),
     });
 
@@ -45,19 +51,68 @@ async fn handle_conn(
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
+    // One writer, fed by a queue, so replies can be produced out of order.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if write.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     while let Some(msg) = read.next().await {
         match msg? {
             Message::Text(text) => {
-                if let Some(reply) = handle_rpc(&text, &state).await {
-                    write.send(Message::Text(reply)).await?;
+                // Apple Music commands take 1-2 seconds (they drive another
+                // app's UI and may launch it). Awaiting one here would hold up
+                // every later message on this socket — including the volume
+                // polling, which then times out and drops the mixer offline for
+                // a reason that has nothing to do with audio. Observed in the
+                // plugin log on 2026-09-20 as
+                // "Poll could not read audio sessions: ... timed out".
+                //
+                // So the slow methods are dispatched concurrently and the audio
+                // methods stay inline. Keeping the audio path serialized is
+                // deliberate: getApplicationInstanceCount publishes the
+                // snapshot that the following index reads consume, and running
+                // two of those at once would let one burst read another's
+                // snapshot.
+                if is_slow_method(&text) {
+                    let state = state.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        if let Some(reply) = handle_rpc(&text, &state).await {
+                            let _ = out_tx.send(Message::Text(reply));
+                        }
+                    });
+                } else if let Some(reply) = handle_rpc(&text, &state).await {
+                    if out_tx.send(Message::Text(reply)).is_err() {
+                        break;
+                    }
                 }
             }
-            Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
+            Message::Ping(payload) => {
+                if out_tx.send(Message::Pong(payload)).is_err() {
+                    break;
+                }
+            }
             Message::Close(_) => break,
             _ => {}
         }
     }
+
+    drop(out_tx);
+    let _ = writer.await;
     Ok(())
+}
+
+/// Whether a request should be run off the connection's read loop.
+///
+/// Matched on the raw text so the decision costs one substring scan rather than
+/// a full parse of every message on the hot path.
+fn is_slow_method(text: &str) -> bool {
+    text.contains("\"appleMusic")
 }
 
 async fn handle_rpc(text: &str, state: &Arc<AppState>) -> Option<String> {
@@ -75,7 +130,7 @@ async fn handle_rpc(text: &str, state: &Arc<AppState>) -> Option<String> {
             let _ = state.tx.send(Cmd::GetDefaultDevice(reply));
             match rx.await.ok().flatten() {
                 Some(device) => Ok(serde_json::to_value(device).unwrap_or(Value::Null)),
-                None => Err("no default output device"),
+                None => Err("no default output device".into()),
             }
         }
         "setSystemDefaultDeviceVolume" => {
@@ -103,7 +158,7 @@ async fn handle_rpc(text: &str, state: &Arc<AppState>) -> Option<String> {
             let snapshot = state.snapshot.lock().await;
             match snapshot.get(index) {
                 Some(instance) => Ok(serde_json::to_value(instance).unwrap_or(Value::Null)),
-                None => Err("index out of range"),
+                None => Err("index out of range".into()),
             }
         }
         "setApplicationInstanceVolume" => {
@@ -122,7 +177,82 @@ async fn handle_rpc(text: &str, state: &Arc<AppState>) -> Option<String> {
             }
             Ok(Value::Null)
         }
-        _ => Err("unknown method"),
+        // --- Apple Music -----------------------------------------------------
+        // These go to the media thread and can legitimately take seconds (they
+        // may have to launch the app and wait for its window), so unlike the
+        // audio methods they report failure as a JSON-RPC error with a reason
+        // the plugin can show on the key. Silently doing nothing is the worst
+        // outcome here: the user presses a key and cannot tell whether it
+        // worked.
+        "appleMusicListPlaylists" => {
+            let (reply, rx) = oneshot::channel();
+            let _ = state.media_tx.send(MediaCmd::ListPlaylists(reply));
+            match rx.await {
+                Ok(Ok(playlists)) => Ok(json!({ "playlists": playlists })),
+                Ok(Err(message)) => Err(message),
+                Err(_) => Err("media thread is not answering".into()),
+            }
+        }
+        "appleMusicPlayPlaylist" => {
+            let id = params
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let shuffle = params
+                .get("shuffle")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let (reply, rx) = oneshot::channel();
+            let _ = state.media_tx.send(MediaCmd::PlayPlaylist {
+                id,
+                name,
+                shuffle,
+                reply,
+            });
+            match rx.await {
+                Ok(Ok(())) => Ok(Value::Null),
+                Ok(Err(message)) => Err(message),
+                Err(_) => Err("media thread is not answering".into()),
+            }
+        }
+        "appleMusicResume" | "appleMusicPause" => {
+            let (reply, rx) = oneshot::channel();
+            let cmd = if method == "appleMusicResume" {
+                MediaCmd::Resume(reply)
+            } else {
+                MediaCmd::Pause(reply)
+            };
+            let _ = state.media_tx.send(cmd);
+            match rx.await {
+                Ok(Ok(())) => Ok(Value::Null),
+                Ok(Err(message)) => Err(message),
+                Err(_) => Err("media thread is not answering".into()),
+            }
+        }
+        "appleMusicStatus" => {
+            let (reply, rx) = oneshot::channel();
+            let _ = state.media_tx.send(MediaCmd::Status(reply));
+            match rx.await {
+                Ok(status) => Ok(serde_json::to_value(status).unwrap_or(Value::Null)),
+                Err(_) => Err("media thread is not answering".into()),
+            }
+        }
+        "appleMusicLaunch" => {
+            let (reply, rx) = oneshot::channel();
+            let _ = state.media_tx.send(MediaCmd::Launch(reply));
+            match rx.await {
+                Ok(Ok(())) => Ok(Value::Null),
+                Ok(Err(message)) => Err(message),
+                Err(_) => Err("media thread is not answering".into()),
+            }
+        }
+        _ => Err("unknown method".into()),
     };
 
     let envelope = match result {

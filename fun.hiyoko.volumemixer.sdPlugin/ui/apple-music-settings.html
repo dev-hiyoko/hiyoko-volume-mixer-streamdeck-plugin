@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Apple Music プレイリスト</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d0d0f;
+      --panel: #151517;
+      --panel-2: #1c1c1f;
+      --panel-3: #26262b;
+      --line: #2b2b30;
+      --line-strong: #3c3c42;
+      --text: #f4f4f5;
+      --muted: #9a9aa1;
+      --danger: #ff5a5a;
+      --radius: 10px;
+      accent-color: var(--text);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { padding: 14px; display: grid; gap: 14px; }
+    .section {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .section h2 {
+      margin: 0 0 2px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .row { display: grid; grid-template-columns: 124px minmax(0, 1fr); gap: 10px; align-items: center; }
+    .row > label { color: var(--muted); font-size: 12px; }
+    select, button {
+      width: 100%;
+      padding: 7px 9px;
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      font: inherit;
+    }
+    button { cursor: pointer; background: var(--panel-3); }
+    button:hover { border-color: var(--text); }
+    .check { display: flex; gap: 8px; align-items: center; }
+    .check input { width: 15px; height: 15px; }
+    .hint { color: var(--muted); font-size: 11px; margin: 0; }
+    .hint.bad { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="section">
+      <h2>プレイリスト</h2>
+      <div class="row">
+        <label for="playlist">対象</label>
+        <select id="playlist"><option value="">（読み込み中…）</option></select>
+      </div>
+      <div class="row">
+        <label for="reload">一覧</label>
+        <button id="reload" type="button">Apple Music から再取得</button>
+      </div>
+      <p class="hint" id="hint">
+        一覧は Apple Music の画面から読み取ります。出てこないときは Apple Music を起動してから再取得してください。
+      </p>
+    </div>
+
+    <div class="section">
+      <h2>再生のしかた</h2>
+      <div class="check">
+        <input type="checkbox" id="shuffle" checked />
+        <label for="shuffle">シャッフルで開始する</label>
+      </div>
+      <p class="hint">
+        キーを押すとこのプレイリストが始まります。もう一度押すと一時停止、さらに押すと続きから再開します。
+        Apple Music が起動していなければ自動で起動します。
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const state = { websocket: null, context: null, actionUUID: null, settings: {} };
+
+    const $playlist = document.getElementById("playlist");
+    const $shuffle = document.getElementById("shuffle");
+    const $reload = document.getElementById("reload");
+    const $hint = document.getElementById("hint");
+
+    function setHint(text, bad) {
+      $hint.textContent = text;
+      $hint.classList.toggle("bad", Boolean(bad));
+    }
+
+    /**
+     * Rebuilds the picker. The saved playlist is kept as an option even when it
+     * is missing from the fetched list (Apple Music closed, or the playlist was
+     * deleted) so that simply opening this panel cannot silently clear the key.
+     */
+    function fillPlaylists(playlists) {
+      const savedId = state.settings.playlistId || "";
+      const savedName = state.settings.playlistName || "";
+      $playlist.innerHTML = "";
+
+      const blank = document.createElement("option");
+      blank.value = "";
+      blank.textContent = "（未設定）";
+      $playlist.appendChild(blank);
+
+      let sawSaved = false;
+      for (const item of playlists) {
+        const option = document.createElement("option");
+        option.value = item.id;
+        option.textContent = item.name;
+        option.dataset.name = item.name;
+        if (item.id === savedId) sawSaved = true;
+        $playlist.appendChild(option);
+      }
+
+      if (savedId && !sawSaved) {
+        const option = document.createElement("option");
+        option.value = savedId;
+        option.textContent = savedName + "（いまは一覧にありません）";
+        option.dataset.name = savedName;
+        $playlist.appendChild(option);
+      }
+
+      $playlist.value = savedId;
+    }
+
+    function save() {
+      const option = $playlist.selectedOptions[0];
+      state.settings = {
+        playlistId: $playlist.value || undefined,
+        playlistName: ($playlist.value && option ? option.dataset.name || option.textContent : undefined),
+        shuffle: $shuffle.checked,
+      };
+      if (!state.websocket || state.websocket.readyState !== WebSocket.OPEN || !state.context) return;
+      state.websocket.send(JSON.stringify({
+        event: "setSettings",
+        context: state.context,
+        payload: state.settings,
+      }));
+    }
+
+    function requestPlaylists() {
+      if (!state.websocket || state.websocket.readyState !== WebSocket.OPEN || !state.actionUUID) return;
+      setHint("Apple Music から取得しています…");
+      state.websocket.send(JSON.stringify({
+        event: "sendToPlugin",
+        context: state.context,
+        action: state.actionUUID,
+        payload: { request: "getPlaylists" },
+      }));
+    }
+
+    function applySettings(settings) {
+      state.settings = settings || {};
+      $shuffle.checked = state.settings.shuffle !== false;
+      fillPlaylists([]);
+      requestPlaylists();
+    }
+
+    $playlist.addEventListener("change", save);
+    $shuffle.addEventListener("change", save);
+    $reload.addEventListener("click", requestPlaylists);
+
+    function connectElgatoStreamDeckSocket(inPort, inPluginUUID, inRegisterEvent, inInfo, inActionInfo) {
+      state.context = inPluginUUID;
+      try {
+        const info = typeof inActionInfo === "string" ? JSON.parse(inActionInfo) : inActionInfo;
+        state.actionUUID = info && info.action;
+        if (info && info.payload && info.payload.settings) {
+          state.settings = info.payload.settings;
+        }
+      } catch (error) {
+        // Fall back to the getSettings round-trip below.
+      }
+
+      state.websocket = new WebSocket(`ws://127.0.0.1:${inPort}`);
+      state.websocket.onopen = () => {
+        state.websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inPluginUUID }));
+        state.websocket.send(JSON.stringify({ event: "getSettings", context: inPluginUUID }));
+        applySettings(state.settings);
+      };
+
+      state.websocket.onmessage = (event) => {
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch (error) {
+          return;
+        }
+        if (message.event === "didReceiveSettings") {
+          applySettings(message.payload && message.payload.settings);
+          return;
+        }
+        if (message.event === "sendToPropertyInspector") {
+          const payload = message.payload || {};
+          if (payload.event !== "playlists") return;
+          fillPlaylists(payload.playlists || []);
+          if (payload.error) {
+            setHint("取得できませんでした: " + payload.error, true);
+          } else if (!(payload.playlists || []).length) {
+            setHint("プレイリストが見つかりませんでした。Apple Music を起動してから再取得してください。", true);
+          } else {
+            setHint((payload.playlists || []).length + " 件のプレイリストを読み込みました。");
+          }
+        }
+      };
+    }
+
+    window.connectElgatoStreamDeckSocket = connectElgatoStreamDeckSocket;
+  </script>
+</body>
+</html>

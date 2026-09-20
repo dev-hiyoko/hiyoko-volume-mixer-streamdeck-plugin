@@ -39,6 +39,20 @@
       ]
     },
     {
+      "UUID": "fun.hiyoko.volumemixer.apple-music",
+      "Name": "Apple Music プレイリスト",
+      "Tooltip": "プレイリストをシャッフル再生します。もう一度押すと一時停止・再開します。",
+      "Icon": "imgs/action-icon",
+      "Controllers": ["Keypad"],
+      "PropertyInspectorPath": "ui/apple-music-settings.html",
+      "States": [
+        {
+          "Image": "imgs/action-icon",
+          "TitleAlignment": "middle"
+        }
+      ]
+    },
+    {
       "UUID": "fun.hiyoko.volumemixer.restart-server",
       "Name": "音声サーバー再起動",
       "Tooltip": "内蔵の音声サーバーを再起動して、オフラインから復旧します。",

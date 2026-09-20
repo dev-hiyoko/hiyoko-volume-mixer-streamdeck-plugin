@@ -1,5 +1,6 @@
 import streamDeck from "@elgato/streamdeck";
 
+import { AppleMusicAction } from "./actions/apple-music.js";
 import { AppVolumeAction } from "./actions/app-volume.js";
 import { RestartServerAction } from "./actions/restart-server.js";
 import { audioControlClient } from "./audio-control-client.js";
@@ -25,6 +26,7 @@ startAudioServer();
 
 streamDeck.actions.registerAction(new AppVolumeAction());
 streamDeck.actions.registerAction(new RestartServerAction());
+streamDeck.actions.registerAction(new AppleMusicAction());
 
 audioControlClient.connect().catch((error) => {
   streamDeck.logger.warn(`Audio Control WebSocket is not ready yet: ${String(error)}`);
