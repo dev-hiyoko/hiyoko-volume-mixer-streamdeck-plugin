@@ -192,7 +192,9 @@ function transportGlyph(status: "unset" | "idle" | "playing" | "paused" | "worki
 
 /** Crossing arrows, bottom-right, shown only when the key starts shuffled. */
 function shuffleBadge(active: boolean): string {
-  const c = active ? GREEN : FAINT;
+  // White rather than a colour: the badge says how the key is configured, which
+  // never changes on its own, so it should not compete with the glyph that does.
+  const c = active ? WHITE : FAINT;
   return (
     `<g transform="translate(58,20) scale(0.62)">` +
     `<path d="M-12 -8 L-4 -8 L8 8 L14 8" fill="none" stroke="${c}" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>` +
