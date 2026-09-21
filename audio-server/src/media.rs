@@ -160,14 +160,98 @@ enum Transport {
     Pause,
 }
 
+/// How long to wait before building another manager once one has been dropped.
+///
+/// Building one is the expensive act this cache exists to avoid, and a failure
+/// that persists would otherwise restore the original behaviour exactly: a new
+/// manager — and a new registration inside NPSMSvc — every two seconds. Going
+/// without one for a few seconds only makes status() report "not running",
+/// which is what it would report anyway while the manager is unusable.
+const MANAGER_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// The SMTC session manager and when it was last built.
+struct ManagerCache {
+    manager: Option<GlobalSystemMediaTransportControlsSessionManager>,
+    /// Set on every build attempt, successful or not, so a failing one is not
+    /// retried on the next poll.
+    last_build: Option<Instant>,
+}
+
+thread_local! {
+    /// The SMTC session manager for this thread. Built on first use, and again
+    /// only after a call against it fails.
+    ///
+    /// RequestAsync() is not a getter: every call hands back a *new* manager,
+    /// and each one registers as a client of NPSMSvc (the "Now Playing Session
+    /// Manager" service). Building one per poll measured at 196ms of NPSMSvc
+    /// CPU per call, on an idle machine with Apple Music closed — against 0.3ms
+    /// for a whole audio command — and the service held on to the
+    /// registrations, so an 11-hour run left it at ~480 threads and eight
+    /// cores' worth of CPU (2026-09-21). The manager is a live object that
+    /// tracks sessions itself, so keeping one and re-reading GetSessions()
+    /// answers the same question for nothing.
+    ///
+    /// Deliberately no TTL, unlike the audio thread's endpoint cache: there the
+    /// re-resolve is cheap and guards against a device changing underneath it,
+    /// here the rebuild *is* the cost being removed, and it buys nothing — the
+    /// manager follows sessions coming and going on its own (Apple Music closed
+    /// and reopened is picked up in 3s, measured). Adding one to match audio.rs
+    /// would put back a share of the storm for no gain.
+    static SMTC_MANAGER: RefCell<ManagerCache> = const {
+        RefCell::new(ManagerCache {
+            manager: None,
+            last_build: None,
+        })
+    };
+}
+
+/// Forces the next call to build a fresh manager, after MANAGER_RETRY_DELAY.
+///
+/// Called whenever a call against the cached manager fails. Whether that is
+/// enough to notice a manager left behind by a restarted NPSMSvc is *not*
+/// established: it depends on whether the WinRT wrapper asks the service on
+/// every GetSessions() or answers from its own copy, and restarting the service
+/// to find out needs rights this build has not been run with. So the failure
+/// paths below are deliberately wider than the one that has been observed —
+/// anything the manager or its sessions refuse to answer drops it.
+fn drop_session_manager() {
+    SMTC_MANAGER.with(|cell| cell.borrow_mut().manager = None);
+}
+
+fn session_manager() -> Option<GlobalSystemMediaTransportControlsSessionManager> {
+    SMTC_MANAGER.with(|cell| {
+        {
+            let cached = cell.borrow();
+            if let Some(existing) = cached.manager.as_ref() {
+                return Some(existing.clone());
+            }
+            if let Some(at) = cached.last_build {
+                if at.elapsed() < MANAGER_RETRY_DELAY {
+                    return None;
+                }
+            }
+        }
+        let built = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .ok()
+            .and_then(|op| op.get().ok());
+        let mut cached = cell.borrow_mut();
+        cached.last_build = Some(Instant::now());
+        cached.manager = built.clone();
+        built
+    })
+}
+
 /// The Apple Music SMTC session, or None when the app is not running / has not
 /// registered one yet.
 fn apple_music_session() -> Option<GlobalSystemMediaTransportControlsSession> {
-    let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-        .ok()?
-        .get()
-        .ok()?;
-    let sessions = manager.GetSessions().ok()?;
+    let manager = session_manager()?;
+    let sessions = match manager.GetSessions() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            drop_session_manager();
+            return None;
+        }
+    };
     for session in sessions {
         if let Ok(source) = session.SourceAppUserModelId() {
             if source.to_string() == APPLE_MUSIC_AUMID {
@@ -196,11 +280,17 @@ fn status() -> MediaStatus {
         ..Default::default()
     };
 
-    if let Ok(info) = session.GetPlaybackInfo() {
-        if let Ok(playback) = info.PlaybackStatus() {
-            out.playing = playback == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
-            out.paused = playback == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused;
+    match session.GetPlaybackInfo() {
+        Ok(info) => {
+            if let Ok(playback) = info.PlaybackStatus() {
+                out.playing = playback == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+                out.paused = playback == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused;
+            }
         }
+        // A session that will not say whether it is playing came from a manager
+        // that is no longer good for anything. This is the cheapest place that
+        // notices, since it runs on every poll.
+        Err(_) => drop_session_manager(),
     }
 
     if let Ok(props) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) {
@@ -217,7 +307,12 @@ fn transport(action: Transport) -> Result<(), String> {
         Transport::Play => session.TryPlayAsync().and_then(|op| op.get()),
         Transport::Pause => session.TryPauseAsync().and_then(|op| op.get()),
     }
-    .map_err(|e| format!("media transport call failed: {e}"))?;
+    .map_err(|e| {
+        // Same reasoning as status(): the session answered nothing, so the
+        // manager it came from is suspect.
+        drop_session_manager();
+        format!("media transport call failed: {e}")
+    })?;
     if ok {
         Ok(())
     } else {
