@@ -27,6 +27,14 @@ windows = { version = "0.58", features = [
     "Foundation",
     "Foundation_Collections",
     "Win32_UI_Accessibility",
+    # URX22 mix control (see src/urx.rs): the device's USB CDC serial port,
+    # found through its registry entry and checked present through cfgmgr32.
+    "Win32_Devices_Communication",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Registry",
 ] }
 windows-core = "0.58"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

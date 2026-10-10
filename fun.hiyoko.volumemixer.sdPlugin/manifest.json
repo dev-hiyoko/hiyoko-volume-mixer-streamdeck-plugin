@@ -53,6 +53,20 @@
       ]
     },
     {
+      "UUID": "fun.hiyoko.volumemixer.urx-mix",
+      "Name": "URX22 MIX オン/オフ",
+      "Tooltip": "Yamaha URX22 の MIX1 / MIX2 をオン・オフします（マイクのミュートに）。Device Center は不要です。",
+      "Icon": "imgs/action-icon",
+      "Controllers": ["Keypad"],
+      "PropertyInspectorPath": "ui/urx-mix-settings.html",
+      "States": [
+        {
+          "Image": "imgs/action-icon",
+          "TitleAlignment": "middle"
+        }
+      ]
+    },
+    {
       "UUID": "fun.hiyoko.volumemixer.restart-server",
       "Name": "音声サーバー再起動",
       "Tooltip": "内蔵の音声サーバーを再起動して、オフラインから復旧します。",

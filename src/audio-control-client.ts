@@ -9,6 +9,11 @@ const REQUEST_TIMEOUT_MS = 3000;
 // Measured 2026-09-20: starting a playlist takes ~2.2s on a warm app, and the
 // server itself waits up to 20s for a cold launch.
 const APPLE_MUSIC_TIMEOUT_MS = 30000;
+// URX22 commands open a serial port and wait for the device's hello on the
+// first press (a few hundred ms). Kept off REQUEST_TIMEOUT_MS on purpose: a slow
+// or absent interface says nothing about the audio server's health, so it must
+// not feed the breaker the volume keys share.
+const URX_TIMEOUT_MS = 5000;
 
 // Reconnect backoff. The audio server may be briefly unavailable — during the
 // plugin's own startup before it has finished spawning, or across a manual
@@ -376,6 +381,15 @@ export class AudioControlClient {
 
   async appleMusicPause(): Promise<void> {
     await this.request<null>("appleMusicPause", {}, APPLE_MUSIC_TIMEOUT_MS);
+  }
+
+  // --- Yamaha URX22 ----------------------------------------------------------
+  // Talks to the interface's own control port, not to Windows audio. Failures
+  // (not connected, port held by Yamaha Device Center) come back as errors so
+  // the key can show them.
+
+  async urxSetMixOn(mix: 1 | 2, on: boolean): Promise<void> {
+    await this.request<null>("urxSetMixOn", { mix, on }, URX_TIMEOUT_MS);
   }
 
   private async requestNoResponse(method: string, params: Record<string, unknown>): Promise<void> {

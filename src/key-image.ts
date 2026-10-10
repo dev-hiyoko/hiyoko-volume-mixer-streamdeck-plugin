@@ -20,6 +20,14 @@ export type KeyImageOptions =
   | { kind: "mute"; name: string; muted: boolean; count?: number; icon?: string }
   | { kind: "empty"; name: string }
   | { kind: "offline" }
+  | {
+      kind: "urx";
+      mix: 1 | 2;
+      /** "unknown" until this plugin has set the bus — the device is not read back. */
+      state: "on" | "off" | "unknown" | "error";
+      /** Short reason shown under an error, e.g. "使用中". Defaults to "失敗". */
+      reason?: string;
+    }
   | { kind: "restart"; status: "idle" | "working" | "ok" | "error" }
   | {
       kind: "music";
@@ -222,6 +230,23 @@ export function renderKeyImage(opts: KeyImageOptions): string {
               ? bottomText("一時停止", MUTED)
               : bottomText(opts.shuffle ? "シャッフル" : "順番に", MUTED);
     return frame(nameText(label(opts.name)) + shuffleBadge(opts.shuffle) + transportGlyph(opts.status, color) + caption);
+  }
+
+  if (opts.kind === "urx") {
+    const name = nameText(`MIX${opts.mix}`);
+    if (opts.state === "error") {
+      return frame(name + transportGlyph("error", RED) + bottomText(opts.reason ?? "失敗", RED, true));
+    }
+    // OFF is the resting state (the bus is kept off and only opened to talk), so
+    // it stays quiet and grey; red would make a normal key look like an alarm.
+    if (opts.state === "off") {
+      const slash = `<line x1="20" y1="20" x2="50" y2="50" stroke="${MUTED}" stroke-width="4.5" stroke-linecap="round"/>`;
+      return frame(name + muteGlyph("mic", true, MUTED) + slash + bottomText("オフ", MUTED));
+    }
+    if (opts.state === "on") {
+      return frame(name + muteGlyph("mic", false, GREEN) + bottomText("オン", GREEN, true));
+    }
+    return frame(name + muteGlyph("mic", false, FAINT) + bottomText("不明", MUTED));
   }
 
   if (opts.kind === "offline") {

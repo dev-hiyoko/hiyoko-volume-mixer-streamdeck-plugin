@@ -10,6 +10,7 @@
 mod audio;
 mod media;
 mod server;
+mod urx;
 
 fn main() {
     let port: u16 = std::env::args()
@@ -36,12 +37,21 @@ fn main() {
         .spawn(move || media::run_media_thread(media_rx))
         .expect("spawn media thread");
 
+    // The URX22 serial port, on a thread of its own for the same reason: opening
+    // it and waiting for the device's hello takes a few hundred milliseconds,
+    // and its keepalive must keep ticking whatever the other threads are doing.
+    let (urx_tx, urx_rx) = crossbeam_channel::unbounded::<urx::UrxCmd>();
+    std::thread::Builder::new()
+        .name("urx-control".into())
+        .spawn(move || urx::run_urx_thread(urx_rx))
+        .expect("spawn urx thread");
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
 
-    if let Err(e) = rt.block_on(server::serve(&addr, tx, media_tx)) {
+    if let Err(e) = rt.block_on(server::serve(&addr, tx, media_tx, urx_tx)) {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }

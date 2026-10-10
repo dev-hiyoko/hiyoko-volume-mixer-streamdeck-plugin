@@ -3,6 +3,7 @@ import streamDeck from "@elgato/streamdeck";
 import { AppleMusicAction } from "./actions/apple-music.js";
 import { AppVolumeAction } from "./actions/app-volume.js";
 import { RestartServerAction } from "./actions/restart-server.js";
+import { UrxMixAction } from "./actions/urx-mix.js";
 import { audioControlClient } from "./audio-control-client.js";
 import { startAudioServer } from "./audio-server-process.js";
 
@@ -27,6 +28,7 @@ startAudioServer();
 streamDeck.actions.registerAction(new AppVolumeAction());
 streamDeck.actions.registerAction(new RestartServerAction());
 streamDeck.actions.registerAction(new AppleMusicAction());
+streamDeck.actions.registerAction(new UrxMixAction());
 
 // The server was spawned a moment ago and needs a beat to bind its port, so
 // keep probing at a steady rate rather than letting a first failure put us on

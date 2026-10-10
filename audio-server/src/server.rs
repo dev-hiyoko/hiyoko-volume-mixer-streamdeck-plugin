@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::audio::{AppInstance, Cmd};
 use crate::media::MediaCmd;
+use crate::urx::{UrxCmd, UrxMix};
 
 pub struct AppState {
     tx: Sender<Cmd>,
@@ -19,17 +20,26 @@ pub struct AppState {
     /// calls can block for seconds, and must never queue behind (or ahead of)
     /// the audio commands.
     media_tx: Sender<MediaCmd>,
+    /// URX22 control. Its own thread, because it owns a serial port that has to
+    /// be kept alive between commands.
+    urx_tx: Sender<UrxCmd>,
     /// Snapshot taken on getApplicationInstanceCount and read by index, so a
     /// count+index burst from the plugin sees a consistent list.
     snapshot: Mutex<Vec<AppInstance>>,
 }
 
-pub async fn serve(addr: &str, tx: Sender<Cmd>, media_tx: Sender<MediaCmd>) -> std::io::Result<()> {
+pub async fn serve(
+    addr: &str,
+    tx: Sender<Cmd>,
+    media_tx: Sender<MediaCmd>,
+    urx_tx: Sender<UrxCmd>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("hiyoko-audio-server listening on {addr}");
     let state = Arc::new(AppState {
         tx,
         media_tx,
+        urx_tx,
         snapshot: Mutex::new(Vec::new()),
     });
 
@@ -112,7 +122,7 @@ async fn handle_conn(
 /// Matched on the raw text so the decision costs one substring scan rather than
 /// a full parse of every message on the hot path.
 fn is_slow_method(text: &str) -> bool {
-    text.contains("\"appleMusic")
+    text.contains("\"appleMusic") || text.contains("\"urx")
 }
 
 async fn handle_rpc(text: &str, state: &Arc<AppState>) -> Option<String> {
@@ -250,6 +260,26 @@ async fn handle_rpc(text: &str, state: &Arc<AppState>) -> Option<String> {
                 Ok(Ok(())) => Ok(Value::Null),
                 Ok(Err(message)) => Err(message),
                 Err(_) => Err("media thread is not answering".into()),
+            }
+        }
+        // --- URX22 ----------------------------------------------------------
+        // The parameters are checked here, before anything reaches the serial
+        // port: the port also takes firmware updates, so a malformed request
+        // must be refused rather than coerced into some index or value.
+        "urxSetMixOn" => {
+            let mix = params.get("mix").and_then(Value::as_u64).and_then(UrxMix::from_number);
+            let on = params.get("on").and_then(Value::as_bool);
+            match (mix, on) {
+                (Some(mix), Some(on)) => {
+                    let (reply, rx) = oneshot::channel();
+                    let _ = state.urx_tx.send(UrxCmd::SetMixOn { mix, on, reply });
+                    match rx.await {
+                        Ok(Ok(())) => Ok(Value::Null),
+                        Ok(Err(message)) => Err(message),
+                        Err(_) => Err("urx thread is not answering".into()),
+                    }
+                }
+                _ => Err("invalid params: expected { mix: 1 | 2, on: boolean }".into()),
             }
         }
         _ => Err("unknown method".into()),
